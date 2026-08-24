@@ -7,13 +7,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="2.1")
+app = FastAPI(title="iPod CC API", version="2.2")
 
-# Cache simples em memória para evitar re-extração no YouTube (duração: 1 hora)
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
 
-# Opções otimizadas para busca rápida
 YTDL_SEARCH_OPTS = {
     'extract_flat': 'in_playlist',
     'skip_download': True,
@@ -24,7 +22,6 @@ YTDL_SEARCH_OPTS = {
     'youtube_include_hls_manifest': False,
 }
 
-# Opções otimizadas para extração de stream de áudio
 YTDL_STREAM_OPTS = {
     'format': 'ba/ba*',
     'skip_download': True,
@@ -36,7 +33,6 @@ YTDL_STREAM_OPTS = {
 }
 
 async def fetch_yt_info(target: str, opts: dict) -> dict:
-    """Executa o yt-dlp em uma thread separada sem travar o loop de eventos."""
     def _extract():
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(target, download=False)
@@ -45,20 +41,16 @@ async def fetch_yt_info(target: str, opts: dict) -> dict:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def handle_request(request: Request, search: str = None, id: str = None, v: str = "2.1"):
-    # Suporte a Head/Healthcheck para Pingers e Render
     if request.method == "HEAD" or (not search and not id):
         return JSONResponse(content={"status": "online", "version": v})
 
-    # ============================================================
     # MODO BUSCA (JSON)
-    # ============================================================
     if search:
         try:
             target = search if search.startswith("http") else f"ytsearch5:{search}"
             info = await fetch_yt_info(target, YTDL_SEARCH_OPTS)
             
             results = [{"status": "ok"}]
-            
             if 'entries' in info:
                 if info.get('_type') == 'playlist' and ('list=' in search or 'playlist' in search):
                     playlist_items = [
@@ -94,69 +86,64 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                 })
                 
             return JSONResponse(content=results)
-
         except Exception as e:
             return JSONResponse(status_code=500, content=[{"status": "error"}, {"message": str(e)}])
 
-    # ============================================================
-    # MODO STREAMING DE ÁUDIO (DFPWM Binário)
-    # ============================================================
+    # MODO STREAMING (DFPWM)
     elif id:
-        try:
-            now = time.time()
-            # Verifica se a URL do áudio está no cache
-            if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
-                audio_url = URL_CACHE[id]['url']
-            else:
-                info = await fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
-                audio_url = info['url']
-                URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
+        async def stream_bytes():
+            # 1. Envia 0.5s de silêncio DFPWM (0x55) IMEDIATAMENTE para forçar o HTTP 200 OK pro CC
+            yield b'\x55' * 3000
 
-            # Inicia conversão FFmpeg via Pipe diretamente para DFPWM (48kHz Mono)
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-i', audio_url,
-                '-f', 'dfpwm',
-                '-ar', '48000',
-                '-ac', '1',
-                'pipe:1'
-            ]
-            
-            proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = None
+            try:
+                now = time.time()
+                if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
+                    audio_url = URL_CACHE[id]['url']
+                else:
+                    info = await fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
+                    audio_url = info['url']
+                    URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
 
-            async def stream_bytes():
-                try:
-                    while True:
-                        # Leitura assíncrona do stdout do ffmpeg em chunks de 4KB
-                        chunk = await asyncio.to_thread(proc.stdout.read, 4096)
-                        if not chunk:
-                            break
-                        yield chunk
-                except asyncio.CancelledError:
-                    # Executado quando o ComputerCraft desconecta ou pula a música
-                    pass
-                finally:
-                    # Garante o fechamento do processo para economizar recursos
-                    if proc.poll() is None:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=1)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                    if proc.stdout:
-                        proc.stdout.close()
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-reconnect', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_delay_max', '5',
+                    '-i', audio_url,
+                    '-f', 'dfpwm',
+                    '-ar', '48000',
+                    '-ac', '1',
+                    'pipe:1'
+                ]
+                
+                proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-            return StreamingResponse(
-                stream_bytes(), 
-                media_type="application/octet-stream",
-                headers={"Cache-Control": "no-cache"}
-            )
+                while True:
+                    chunk = await asyncio.to_thread(proc.stdout.read, 4096)
+                    if not chunk:
+                        break
+                    yield chunk
 
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Erro na transmissão: {e}")
+            finally:
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                if proc and proc.stdout:
+                    proc.stdout.close()
+
+        return StreamingResponse(
+            stream_bytes(), 
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-cache"}
+        )
 
     return JSONResponse(content={"status": "error", "message": "Parâmetros inválidos"})
 

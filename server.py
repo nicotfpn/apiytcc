@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="4.1")
+app = FastAPI(title="iPod CC API", version="4.2")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 2700
@@ -66,10 +66,6 @@ def validate_cookies() -> bool:
         return False
 
 COOKIES_VALID = validate_cookies()
-if COOKIES_VALID:
-    print(">>> SUCESSO: Cookies do YouTube validados e funcionais!")
-else:
-    print(">>> AVISO: Os cookies presentes falharam na validação ativa ou não existem.")
 
 # ============================================================
 # LISTAS DE PROXIES (Piped e Invidious)
@@ -126,19 +122,16 @@ def pick_best_audio_url(formats: List[dict]) -> str:
         acodec = fmt.get('acodec')
         return fmt.get('url') and acodec not in (None, 'none', '')
 
-    # 1. Prioridade: áudio puro (sem vídeo) de alta qualidade
-    audio_only = [f for f in formats if has_real_audio(f) and f.get('vcodec') in (None, 'none')]
+    audio_only = [f for f in formats if has_real_audio(f) and f.get('vcodec'] in (None, 'none')]
     if audio_only:
         audio_only.sort(key=lambda f: f.get('abr') or 0, reverse=True)
         return audio_only[0]['url']
 
-    # 2. Fallback: formato misto que contenha áudio real válido
     with_audio = [f for f in formats if has_real_audio(f)]
     if with_audio:
         with_audio.sort(key=lambda f: f.get('abr') or 0, reverse=True)
         return with_audio[0]['url']
 
-    # 3. Nenhuma url com áudio real identificada
     return None
 
 def fetch_via_ytdl_manual(video_id: str) -> str:
@@ -150,25 +143,14 @@ def fetch_via_ytdl_manual(video_id: str) -> str:
         return pick_best_audio_url(info.get('formats', []))
 
 async def get_direct_audio_url(video_id: str) -> str:
-    # 1. Tenta yt-dlp com cookies primeiro
-    if COOKIES_VALID:
-        try:
-            url = await asyncio.wait_for(
-                asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=8
-            )
-            if url:
-                return url
-        except Exception as e:
-            print(f">>> [FALHA COOKIES] yt-dlp falhou para o ID {video_id}: {e}")
-
-    # 2. Se falhar, dispara Piped e Invidious em paralelo
+    # 1. NOVO: Tenta Piped e Invidious PRIMEIRO (eles contornam o bloqueio de bot do IP do Render)
     tasks = [
         asyncio.create_task(asyncio.to_thread(fetch_via_piped, video_id)),
         asyncio.create_task(asyncio.to_thread(fetch_via_invidious, video_id)),
     ]
     
     try:
-        for coro in asyncio.as_completed(tasks, timeout=6):
+        for coro in asyncio.as_completed(tasks, timeout=5):
             try:
                 result = await coro
                 if result:
@@ -179,16 +161,27 @@ async def get_direct_audio_url(video_id: str) -> str:
             except Exception:
                 continue
     except asyncio.TimeoutError:
-        print(f">>> [FALHA PROXIES] Piped e Invidious estouraram o timeout para {video_id}")
+        pass
     finally:
         for t in tasks:
             if not t.done():
                 t.cancel()
 
-    # 3. Fallback final com yt-dlp puro sem cookies
+    # 2. Se os proxies falharem, tenta o yt-dlp com cookies como segundo passo
+    if COOKIES_VALID:
+        try:
+            url = await asyncio.wait_for(
+                asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=8
+            )
+            if url:
+                return url
+        except Exception as e:
+            print(f">>> [FALHA COOKIES] yt-dlp falhou para o ID {video_id}: {e}")
+
+    # 3. Fallback final: yt-dlp puro sem cookies
     try:
         url_puro = await asyncio.wait_for(
-            asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=10
+            asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=8
         )
         if url_puro:
             return url_puro
@@ -207,7 +200,6 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
     if request.method == "HEAD" or (not search and not id):
         return JSONResponse(content={"status": "online", "version": v})
 
-    # MODO BUSCA (JSON)
     if search:
         try:
             is_url = search.startswith("http://") or search.startswith("https://")
@@ -257,7 +249,6 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
         except Exception as e:
             return JSONResponse(status_code=500, content=[{"status": "error"}, {"message": str(e)}])
 
-    # MODO STREAMING (DFPWM)
     elif id:
         if not YOUTUBE_ID_REGEX.match(id):
             return JSONResponse(status_code=400, content={"status": "error", "message": "ID de vídeo inválido"})
@@ -265,7 +256,6 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
         now = time.time()
         audio_url = None
 
-        # Resolução limpa ANTES de iniciar o StreamingResponse (evita HTTP 200 falso)
         if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
             audio_url = URL_CACHE[id]['url']
         else:

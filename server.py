@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="4.0")
+app = FastAPI(title="iPod CC API", version="4.1")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 2700
@@ -159,9 +159,9 @@ async def get_direct_audio_url(video_id: str) -> str:
             if url:
                 return url
         except Exception as e:
-            print(f"yt-dlp com cookies falhou para {video_id}: {e}")
+            print(f">>> [FALHA COOKIES] yt-dlp falhou para o ID {video_id}: {e}")
 
-    # 2. Se falhar, dispara Piped e Invidious em paralelo com gerenciamento de tasks órfãs
+    # 2. Se falhar, dispara Piped e Invidious em paralelo
     tasks = [
         asyncio.create_task(asyncio.to_thread(fetch_via_piped, video_id)),
         asyncio.create_task(asyncio.to_thread(fetch_via_invidious, video_id)),
@@ -179,7 +179,7 @@ async def get_direct_audio_url(video_id: str) -> str:
             except Exception:
                 continue
     except asyncio.TimeoutError:
-        pass
+        print(f">>> [FALHA PROXIES] Piped e Invidious estouraram o timeout para {video_id}")
     finally:
         for t in tasks:
             if not t.done():
@@ -187,12 +187,16 @@ async def get_direct_audio_url(video_id: str) -> str:
 
     # 3. Fallback final com yt-dlp puro sem cookies
     try:
-        return await asyncio.wait_for(
+        url_puro = await asyncio.wait_for(
             asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=10
         )
+        if url_puro:
+            return url_puro
     except Exception as e:
-        print(f"Erro fatal no yt-dlp para {video_id}: {e}")
-        return None
+        print(f">>> [FALHA YTDL PURO] Erro fatal no yt-dlp sem cookies para {video_id}: {e}")
+
+    print(f">>> [ERRO CRÍTICO] Todos os métodos falharam para extrair áudio de: {video_id}")
+    return None
 
 # ============================================================
 # ROTAS DA API

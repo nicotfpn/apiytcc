@@ -122,7 +122,7 @@ def pick_best_audio_url(formats: List[dict]) -> str:
         acodec = fmt.get('acodec')
         return fmt.get('url') and acodec not in (None, 'none', '')
 
-    audio_only = [f for f in formats if has_real_audio(f) and f.get('vcodec'] in (None, 'none')]
+    audio_only = [f for f in formats if has_real_audio(f) and f.get('vcodec') in (None, 'none')]
     if audio_only:
         audio_only.sort(key=lambda f: f.get('abr') or 0, reverse=True)
         return audio_only[0]['url']
@@ -143,7 +143,7 @@ def fetch_via_ytdl_manual(video_id: str) -> str:
         return pick_best_audio_url(info.get('formats', []))
 
 async def get_direct_audio_url(video_id: str) -> str:
-    # 1. NOVO: Tenta Piped e Invidious PRIMEIRO (eles contornam o bloqueio de bot do IP do Render)
+    # 1. Tenta Piped e Invidious PRIMEIRO para driblar bloqueio de bot do IP do Render
     tasks = [
         asyncio.create_task(asyncio.to_thread(fetch_via_piped, video_id)),
         asyncio.create_task(asyncio.to_thread(fetch_via_invidious, video_id)),
@@ -167,7 +167,7 @@ async def get_direct_audio_url(video_id: str) -> str:
             if not t.done():
                 t.cancel()
 
-    # 2. Se os proxies falharem, tenta o yt-dlp com cookies como segundo passo
+    # 2. Se os proxies falharem, tenta o yt-dlp com cookies
     if COOKIES_VALID:
         try:
             url = await asyncio.wait_for(

@@ -7,25 +7,43 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="2.3")
+app = FastAPI(title="iPod CC API", version="2.4")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
 
-YTDL_SEARCH_OPTS = {
-    'extract_flat': True,
-    'skip_download': True,
+# Se você definir a variável YT_COOKIES no Render, ele cria o arquivo automaticamente
+COOKIE_FILE = "cookies.txt"
+if os.environ.get("YT_COOKIES"):
+    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+        f.write(os.environ.get("YT_COOKIES"))
+
+# Configurações de bypass para evitar bloqueio por IP de DataCenter
+COMMON_YTDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'socket_timeout': 10,
+    # Bypassa a checagem de bot simulando requisições de iOS/Android
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['ios', 'android', 'mweb']
+        }
+    }
+}
+
+if os.path.exists(COOKIE_FILE):
+    COMMON_YTDL_OPTS['cookiefile'] = COOKIE_FILE
+
+YTDL_SEARCH_OPTS = {
+    **COMMON_YTDL_OPTS,
+    'extract_flat': True,
+    'skip_download': True,
 }
 
 YTDL_STREAM_OPTS = {
+    **COMMON_YTDL_OPTS,
     'format': 'ba/ba*',
     'skip_download': True,
-    'quiet': True,
-    'no_warnings': True,
-    'socket_timeout': 10,
     'youtube_include_dash_manifest': False,
     'youtube_include_hls_manifest': False,
 }
@@ -54,7 +72,6 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
             results = [{"status": "ok"}]
 
             if info:
-                # Trata Playlists
                 if info.get('_type') == 'playlist' or 'entries' in info:
                     entries = list(info.get('entries', []))
                     if is_url and ('list=' in search or 'playlist' in search):
@@ -87,7 +104,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                         "type": "video",
                         "id": info.get("id"),
                         "name": info.get("title", "Sem título"),
-                        "artist": info.get("uploader") or info.get("channel") or "Desconhecido"
+                        "artist": entry.get("uploader") or entry.get("channel") or "Desconhecido"
                     })
 
             return JSONResponse(content=results)
@@ -104,26 +121,22 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                 now = time.time()
                 audio_url = None
 
-                # Verifica Cache primeiro
                 if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
                     audio_url = URL_CACHE[id]['url']
                 else:
-                    # Inicia extração em segundo plano
                     yt_task = asyncio.create_task(
                         fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
                     )
 
-                    # Envia pacotes continuos de silêncio (6000 bytes/seg = taxa exata de DFPWM 48kHz Mono)
-                    # Isso impede que o buffer do alto-falante no CC esvazie e pule a música
+                    # Envia pacotes continuos de silêncio (DFPWM) para preencher o buffer
                     while not yt_task.done():
-                        yield b'\x55' * 1500  # 0.25s de silêncio DFPWM
+                        yield b'\x55' * 1500
                         await asyncio.sleep(0.25)
 
                     info = await yt_task
                     audio_url = info['url']
                     URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
 
-                # Inicia FFmpeg convertendo em tempo real para DFPWM
                 ffmpeg_cmd = [
                     'ffmpeg',
                     '-reconnect', '1',

@@ -10,25 +10,30 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="3.3")
+app = FastAPI(title="iPod CC API", version="3.4")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
 
+# ============================================================
+# CONFIGURAÇÃO YT-DLP E COOKIES
+# ============================================================
 COOKIE_FILE = "cookies.txt"
 if os.environ.get("YT_COOKIES"):
+    # Garante que as aspas e quebras de linha não quebrem o arquivo
+    raw_cookies = os.environ.get("YT_COOKIES").replace('\\n', '\n')
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-        f.write(os.environ.get("YT_COOKIES"))
+        f.write(raw_cookies)
 
-# 'format': 'all' impede que o yt-dlp lance o erro de formato inexistente
 COMMON_YTDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
-    'socket_timeout': 10,
+    'socket_timeout': 15,
     'format': 'all',
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'ios', 'mweb', 'tv_embedded']
+            # Clientes atualizados para evitar o bloqueio de bot
+            'player_client': ['android', 'ios', 'mweb']
         }
     }
 }
@@ -36,6 +41,9 @@ COMMON_YTDL_OPTS = {
 if os.path.exists(COOKIE_FILE):
     COMMON_YTDL_OPTS['cookiefile'] = COOKIE_FILE
 
+# ============================================================
+# LISTAS DE PROXIES (Bypass)
+# ============================================================
 PIPED_INSTANCES = [
     "https://api.piped.video",
     "https://pipedapi.kavin.rocks",
@@ -52,6 +60,12 @@ COBALT_INSTANCES = [
     "https://api.cobalt.tools"
 ]
 
+# Headers reais para enganar os bloqueios de API
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+}
+
 # ============================================================
 # EXTRAÇÃO DE ÁUDIO VIA APIs E FALLBACKS
 # ============================================================
@@ -65,17 +79,20 @@ def fetch_via_cobalt(video_id: str) -> str:
                 f"{instance}/",
                 data=payload,
                 headers={
-                    'Accept': 'application/json',
+                    **BROWSER_HEADERS,
                     'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0'
+                    'Origin': 'https://cobalt.tools',
+                    'Referer': 'https://cobalt.tools/'
                 },
                 method='POST'
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            # Aumentado para 10s (Cobalt às vezes demora pra baixar o áudio)
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 if data.get("status") in ["stream", "redirect", "success"] and data.get("url"):
                     return data["url"]
-        except Exception:
+        except Exception as e:
+            print(f"Cobalt falhou para {video_id}: {e}")
             continue
     return None
 
@@ -83,8 +100,9 @@ def fetch_via_piped(video_id: str) -> str:
     for instance in PIPED_INSTANCES:
         try:
             url = f"{instance}/streams/{video_id}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+            # Aumentado para 10s
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 audio_streams = data.get("audioStreams", [])
                 if audio_streams:
@@ -97,8 +115,9 @@ def fetch_via_invidious(video_id: str) -> str:
     for instance in INVIDIOUS_INSTANCES:
         try:
             url = f"{instance}/api/v1/videos/{video_id}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+            # Aumentado para 10s
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 for fmt in data.get("adaptiveFormats", []):
                     if "audio" in fmt.get("type", ""):
@@ -114,15 +133,12 @@ def fetch_via_ytdl_manual(video_id: str) -> str:
         if not info:
             return None
         
-        # Procura qualquer coisa que sirva como áudio direto na lista do YT
         formats = info.get('formats', [])
         
-        # 1. Tenta áudio puro
         for fmt in reversed(formats):
             if fmt.get('url') and fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':
                 return fmt['url']
         
-        # 2. Tenta áudio com vídeo (o FFmpeg consegue converter sem problemas)
         for fmt in reversed(formats):
             if fmt.get('url'):
                 return fmt['url']
@@ -130,16 +146,19 @@ def fetch_via_ytdl_manual(video_id: str) -> str:
         return info.get('url')
 
 async def get_direct_audio_url(video_id: str) -> str:
-    # Ordem de prioridade de bypass
+    # 1. Cobalt (Mais forte contra bloqueios)
     url = await asyncio.to_thread(fetch_via_cobalt, video_id)
     if url: return url
 
+    # 2. Piped (Muito confiável, mas às vezes lento)
     url = await asyncio.to_thread(fetch_via_piped, video_id)
     if url: return url
 
+    # 3. Invidious
     url = await asyncio.to_thread(fetch_via_invidious, video_id)
     if url: return url
 
+    # 4. yt-dlp (Último recurso se as APIs caírem)
     try:
         return await asyncio.to_thread(fetch_via_ytdl_manual, video_id)
     except Exception as e:
@@ -250,7 +269,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                         break
                     yield chunk
 
-            except asyncio.CancelledError:  # <-- ERRO DE SINTAXE CORRIGIDO AQUI
+            except asyncio.CancelledError:
                 pass
             except Exception as e:
                 print(f"Erro no stream: {e}")

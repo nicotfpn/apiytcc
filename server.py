@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re
 import asyncio
 import subprocess
 import urllib.request
@@ -11,10 +12,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="3.7")
+app = FastAPI(title="iPod CC API", version="3.9")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
+YOUTUBE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
 # ============================================================
 # CONFIGURAÇÃO DE COOKIES E YT-DLP BLINDADO
@@ -42,14 +44,34 @@ COMMON_YTDL_OPTS = {
     },
     'extractor_args': {
         'youtube': {
-            # Força o uso do cliente Android/iOS juntamente com o cookie para bypass de bot
-            'player_client': ['android', 'ios']
+            # Web primeiro para que os cookies de sessão funcionem de verdade
+            'player_client': ['web', 'android'],
+            'player_skip': ['webpage']
         }
     }
 }
 
 if os.path.exists(COOKIE_FILE):
     COMMON_YTDL_OPTS['cookiefile'] = COOKIE_FILE
+
+# Validação ativa do cookie no boot do servidor
+def validate_cookies() -> bool:
+    if not os.path.exists(COOKIE_FILE):
+        return False
+    try:
+        test_opts = {**COMMON_YTDL_OPTS, 'extract_flat': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(test_opts) as ydl:
+            info = ydl.extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ", download=False)
+            return info is not None and info.get('id') is not None
+    except Exception as e:
+        print(f">>> COOKIES INVÁLIDOS OU EXPIRADOS: {e}")
+        return False
+
+COOKIES_VALID = validate_cookies()
+if COOKIES_VALID:
+    print(">>> SUCESSO: Cookies do YouTube validados e funcionais!")
+else:
+    print(">>> AVISO: Os cookies presentes falharam na validação ativa ou não existem.")
 
 # ============================================================
 # LISTAS DE PROXIES (Piped e Invidious)
@@ -73,16 +95,12 @@ BROWSER_HEADERS = {
     'Accept': 'application/json'
 }
 
-# ============================================================
-# EXTRAÇÃO DE ÁUDIO (PIPED -> INVIDIOUS -> YTDL COM COOKIE)
-# ============================================================
-
 def fetch_via_piped(video_id: str) -> str:
     for instance in PIPED_INSTANCES:
         try:
             url = f"{instance}/streams/{video_id}"
             req = urllib.request.Request(url, headers=BROWSER_HEADERS)
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode())
                 audio_streams = data.get("audioStreams", [])
                 if audio_streams:
@@ -96,7 +114,7 @@ def fetch_via_invidious(video_id: str) -> str:
         try:
             url = f"{instance}/api/v1/videos/{video_id}"
             req = urllib.request.Request(url, headers=BROWSER_HEADERS)
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode())
                 for fmt in data.get("adaptiveFormats", []):
                     if "audio" in fmt.get("type", ""):
@@ -122,17 +140,41 @@ def fetch_via_ytdl_manual(video_id: str) -> str:
         return info.get('url')
 
 async def get_direct_audio_url(video_id: str) -> str:
-    # 1. Tenta Piped
-    url = await asyncio.to_thread(fetch_via_piped, video_id)
-    if url: return url
+    # 1. Tenta yt-dlp com cookies primeiro (método principal mais estável)
+    if COOKIES_VALID:
+        try:
+            url = await asyncio.wait_for(
+                asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=8
+            )
+            if url:
+                return url
+        except Exception as e:
+            print(f"yt-dlp com cookies falhou para {video_id}: {e}")
 
-    # 2. Tenta Invidious
-    url = await asyncio.to_thread(fetch_via_invidious, video_id)
-    if url: return url
-
-    # 3. Fallback definitivo com yt-dlp usando o cookies.txt físico da raiz
+    # 2. Se falhar, dispara Piped e Invidious em paralelo
+    tasks = [
+        asyncio.create_task(asyncio.to_thread(fetch_via_piped, video_id)),
+        asyncio.create_task(asyncio.to_thread(fetch_via_invidious, video_id)),
+    ]
+    
     try:
-        return await asyncio.to_thread(fetch_via_ytdl_manual, video_id)
+        for coro in asyncio.as_completed(tasks, timeout=6):
+            try:
+                result = await coro
+                if result:
+                    for t in tasks:
+                        t.cancel()
+                    return result
+            except Exception:
+                continue
+    except asyncio.TimeoutError:
+        pass
+
+    # 3. Fallback final de segurança com yt-dlp puro
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=10
+        )
     except Exception as e:
         print(f"Erro fatal no yt-dlp para {video_id}: {e}")
         return None
@@ -166,7 +208,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                                 "name": entry.get("title", "Sem título"),
                                 "artist": entry.get("uploader") or entry.get("channel") or "YouTube"
                             }
-                            for entry in entries if entry
+                            for entry in entries if entry and entry.get("id")
                         ]
                         results.append({
                             "type": "playlist",
@@ -177,7 +219,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                         })
                     else:
                         for entry in entries:
-                            if entry:
+                            if entry and entry.get("id"):
                                 results.append({
                                     "type": "video",
                                     "id": entry.get("id"),
@@ -198,13 +240,17 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
 
     # MODO STREAMING (DFPWM)
     elif id:
+        # Validação estrita do ID para evitar gastar recursos do FFmpeg com lixo
+        if not YOUTUBE_ID_REGEX.match(id):
+            return JSONResponse(status_code=400, content={"status": "error", "message": "ID de vídeo inválido"})
+
         async def stream_bytes():
             proc = None
             try:
                 now = time.time()
                 audio_url = None
 
-                if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
+                if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < 2700:
                     audio_url = URL_CACHE[id]['url']
                 else:
                     yt_task = asyncio.create_task(get_direct_audio_url(id))
@@ -225,7 +271,8 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                     'ffmpeg',
                     '-reconnect', '1',
                     '-reconnect_streamed', '1',
-                    '-reconnect_delay_max', '5',
+                    '-reconnect_delay_max', '10',
+                    '-rw_timeout', '15000000',
                     '-i', audio_url,
                     '-f', 'dfpwm',
                     '-ar', '48000',
@@ -233,11 +280,15 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                     'pipe:1'
                 ]
                 
-                proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
                 while True:
                     chunk = await asyncio.to_thread(proc.stdout.read, 4096)
                     if not chunk:
+                        if proc.poll() is not None:
+                            err_output = proc.stderr.read().decode('utf-8', errors='ignore')
+                            if err_output:
+                                print(f"Erro interno do FFmpeg: {err_output[-300:]}")
                         break
                     yield chunk
 
@@ -254,6 +305,8 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                         proc.kill()
                 if proc and proc.stdout:
                     proc.stdout.close()
+                if proc and proc.stderr:
+                    proc.stderr.close()
 
         return StreamingResponse(
             stream_bytes(), 

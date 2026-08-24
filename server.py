@@ -7,19 +7,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="2.2")
+app = FastAPI(title="iPod CC API", version="2.3")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
 
 YTDL_SEARCH_OPTS = {
-    'extract_flat': 'in_playlist',
+    'extract_flat': True,
     'skip_download': True,
     'quiet': True,
     'no_warnings': True,
-    'socket_timeout': 5,
-    'youtube_include_dash_manifest': False,
-    'youtube_include_hls_manifest': False,
+    'socket_timeout': 10,
 }
 
 YTDL_STREAM_OPTS = {
@@ -27,7 +25,7 @@ YTDL_STREAM_OPTS = {
     'skip_download': True,
     'quiet': True,
     'no_warnings': True,
-    'socket_timeout': 5,
+    'socket_timeout': 10,
     'youtube_include_dash_manifest': False,
     'youtube_include_hls_manifest': False,
 }
@@ -44,67 +42,88 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
     if request.method == "HEAD" or (not search and not id):
         return JSONResponse(content={"status": "online", "version": v})
 
-    # MODO BUSCA (JSON)
+    # ============================================================
+    # MODO BUSCA / PLAYLIST (JSON)
+    # ============================================================
     if search:
         try:
-            target = search if search.startswith("http") else f"ytsearch5:{search}"
-            info = await fetch_yt_info(target, YTDL_SEARCH_OPTS)
+            is_url = search.startswith("http://") or search.startswith("https://")
+            target = search if is_url else f"ytsearch5:{search}"
             
+            info = await fetch_yt_info(target, YTDL_SEARCH_OPTS)
             results = [{"status": "ok"}]
-            if 'entries' in info:
-                if info.get('_type') == 'playlist' and ('list=' in search or 'playlist' in search):
-                    playlist_items = [
-                        {
-                            "id": entry.get("id"),
-                            "name": entry.get("title", "Sem título"),
-                            "artist": entry.get("uploader") or entry.get("channel") or "YouTube"
-                        }
-                        for entry in info['entries'] if entry
-                    ]
-                    results.append({
-                        "type": "playlist",
-                        "id": info.get("id", ""),
-                        "name": info.get("title", "Playlist"),
-                        "artist": info.get("uploader") or "YouTube",
-                        "playlist_items": playlist_items
-                    })
+
+            if info:
+                # Trata Playlists
+                if info.get('_type') == 'playlist' or 'entries' in info:
+                    entries = list(info.get('entries', []))
+                    if is_url and ('list=' in search or 'playlist' in search):
+                        playlist_items = []
+                        for entry in entries:
+                            if entry:
+                                playlist_items.append({
+                                    "id": entry.get("id"),
+                                    "name": entry.get("title", "Sem título"),
+                                    "artist": entry.get("uploader") or entry.get("channel") or "YouTube"
+                                })
+                        results.append({
+                            "type": "playlist",
+                            "id": info.get("id", ""),
+                            "name": info.get("title", "Playlist"),
+                            "artist": info.get("uploader") or "YouTube",
+                            "playlist_items": playlist_items
+                        })
+                    else:
+                        for entry in entries:
+                            if entry:
+                                results.append({
+                                    "type": "video",
+                                    "id": entry.get("id"),
+                                    "name": entry.get("title", "Sem título"),
+                                    "artist": entry.get("uploader") or entry.get("channel") or "Desconhecido"
+                                })
                 else:
-                    for entry in info['entries']:
-                        if entry:
-                            results.append({
-                                "type": "video",
-                                "id": entry.get("id"),
-                                "name": entry.get("title", "Sem título"),
-                                "artist": entry.get("uploader") or entry.get("channel") or "Desconhecido"
-                            })
-            else:
-                results.append({
-                    "type": "video",
-                    "id": info.get("id"),
-                    "name": info.get("title", "Sem título"),
-                    "artist": info.get("uploader") or info.get("channel") or "Desconhecido"
-                })
-                
+                    results.append({
+                        "type": "video",
+                        "id": info.get("id"),
+                        "name": info.get("title", "Sem título"),
+                        "artist": info.get("uploader") or info.get("channel") or "Desconhecido"
+                    })
+
             return JSONResponse(content=results)
         except Exception as e:
             return JSONResponse(status_code=500, content=[{"status": "error"}, {"message": str(e)}])
 
-    # MODO STREAMING (DFPWM)
+    # ============================================================
+    # MODO STREAMING CONTINUO (DFPWM Binário)
+    # ============================================================
     elif id:
         async def stream_bytes():
-            # 1. Envia 0.5s de silêncio DFPWM (0x55) IMEDIATAMENTE para forçar o HTTP 200 OK pro CC
-            yield b'\x55' * 3000
-
             proc = None
             try:
                 now = time.time()
+                audio_url = None
+
+                # Verifica Cache primeiro
                 if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
                     audio_url = URL_CACHE[id]['url']
                 else:
-                    info = await fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
+                    # Inicia extração em segundo plano
+                    yt_task = asyncio.create_task(
+                        fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
+                    )
+
+                    # Envia pacotes continuos de silêncio (6000 bytes/seg = taxa exata de DFPWM 48kHz Mono)
+                    # Isso impede que o buffer do alto-falante no CC esvazie e pule a música
+                    while not yt_task.done():
+                        yield b'\x55' * 1500  # 0.25s de silêncio DFPWM
+                        await asyncio.sleep(0.25)
+
+                    info = await yt_task
                     audio_url = info['url']
                     URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
 
+                # Inicia FFmpeg convertendo em tempo real para DFPWM
                 ffmpeg_cmd = [
                     'ffmpeg',
                     '-reconnect', '1',
@@ -128,7 +147,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                print(f"Erro na transmissão: {e}")
+                print(f"Erro no stream: {e}")
             finally:
                 if proc and proc.poll() is None:
                     proc.terminate()

@@ -1,75 +1,85 @@
 import os
 import time
+import json
 import asyncio
 import subprocess
+import urllib.request
 from typing import Dict, Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="2.6")
+app = FastAPI(title="iPod CC API", version="3.0")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
 
-COOKIE_FILE = "cookies.txt"
-if os.environ.get("YT_COOKIES"):
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-        f.write(os.environ.get("YT_COOKIES"))
+PIPED_INSTANCES = [
+    "https://api.piped.video",
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.adminforge.de",
+]
 
-COMMON_YTDL_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'socket_timeout': 10,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'ios', 'mweb', 'web']
-        }
-    }
-}
+INVIDIOUS_INSTANCES = [
+    "https://inv.tux.pizza",
+    "https://invidious.drgns.space",
+    "https://vid.puffyan.us",
+]
 
-if os.path.exists(COOKIE_FILE):
-    COMMON_YTDL_OPTS['cookiefile'] = COOKIE_FILE
+def fetch_via_piped(video_id: str) -> str:
+    """Extrai URL do áudio via Piped API (Bypassa o IP ban do Render)."""
+    for instance in PIPED_INSTANCES:
+        try:
+            url = f"{instance}/streams/{video_id}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode())
+                audio_streams = data.get("audioStreams", [])
+                if audio_streams:
+                    return audio_streams[0]["url"]
+        except Exception:
+            continue
+    return None
 
-YTDL_SEARCH_OPTS = {
-    **COMMON_YTDL_OPTS,
-    'extract_flat': True,
-    'skip_download': True,
-}
+def fetch_via_invidious(video_id: str) -> str:
+    """Extrai URL do áudio via Invidious API (Segunda ponte de backup)."""
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            url = f"{instance}/api/v1/videos/{video_id}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode())
+                for fmt in data.get("adaptiveFormats", []):
+                    if "audio" in fmt.get("type", ""):
+                        return fmt["url"]
+        except Exception:
+            continue
+    return None
 
-YTDL_STREAM_OPTS = {
-    **COMMON_YTDL_OPTS,
-    'skip_download': True,
-    'youtube_include_dash_manifest': False,
-    'youtube_include_hls_manifest': False,
-}
+async def get_direct_audio_url(video_id: str) -> str:
+    """Tenta obter a URL do áudio usando múltiplos proxies."""
+    # 1. Tenta Piped API
+    url = await asyncio.to_thread(fetch_via_piped, video_id)
+    if url:
+        return url
 
-async def fetch_yt_stream_url(video_url: str) -> str:
-    """Extrai a URL direta do stream sem quebrar por falta de formato específico."""
-    def _extract():
-        with yt_dlp.YoutubeDL(YTDL_STREAM_OPTS) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            if not info:
-                return None
-            
-            # 1. Retorna a URL principal se selecionada pelo yt-dlp
-            if info.get('url'):
-                return info['url']
-            
-            # 2. Fallback: varre a lista de formatos e pega a primeira URL de stream válida
-            formats = info.get('formats', [])
-            for fmt in reversed(formats):
-                if fmt.get('url'):
-                    return fmt['url']
-            return None
+    # 2. Tenta Invidious API
+    url = await asyncio.to_thread(fetch_via_invidious, video_id)
+    if url:
+        return url
 
-    return await asyncio.to_thread(_extract)
+    # 3. Fallback final: yt-dlp local
+    def _ytdl_fallback():
+        opts = {'quiet': True, 'skip_download': True, 'socket_timeout': 5}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            return info.get('url') if info else None
 
-async def fetch_yt_search(target: str) -> dict:
-    def _extract():
-        with yt_dlp.YoutubeDL(YTDL_SEARCH_OPTS) as ydl:
-            return ydl.extract_info(target, download=False)
-    return await asyncio.to_thread(_extract)
+    try:
+        return await asyncio.to_thread(_ytdl_fallback)
+    except Exception:
+        return None
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -85,21 +95,22 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
             is_url = search.startswith("http://") or search.startswith("https://")
             target = search if is_url else f"ytsearch5:{search}"
             
-            info = await fetch_yt_search(target)
+            opts = {'quiet': True, 'extract_flat': True, 'skip_download': True}
+            info = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(opts).extract_info(target, download=False))
             results = [{"status": "ok"}]
 
             if info:
                 if info.get('_type') == 'playlist' or 'entries' in info:
                     entries = list(info.get('entries', []))
                     if is_url and ('list=' in search or 'playlist' in search):
-                        playlist_items = []
-                        for entry in entries:
-                            if entry:
-                                playlist_items.append({
-                                    "id": entry.get("id"),
-                                    "name": entry.get("title", "Sem título"),
-                                    "artist": entry.get("uploader") or entry.get("channel") or "YouTube"
-                                })
+                        playlist_items = [
+                            {
+                                "id": entry.get("id"),
+                                "name": entry.get("title", "Sem título"),
+                                "artist": entry.get("uploader") or entry.get("channel") or "YouTube"
+                            }
+                            for entry in entries if entry
+                        ]
                         results.append({
                             "type": "playlist",
                             "id": info.get("id", ""),
@@ -121,7 +132,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                         "type": "video",
                         "id": info.get("id"),
                         "name": info.get("title", "Sem título"),
-                        "artist": entry.get("uploader") or entry.get("channel") or "Desconhecido"
+                        "artist": info.get("uploader") or info.get("channel") or "Desconhecido"
                     })
 
             return JSONResponse(content=results)
@@ -141,23 +152,17 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                 if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
                     audio_url = URL_CACHE[id]['url']
                 else:
-                    yt_task = asyncio.create_task(
-                        fetch_yt_stream_url(f"https://www.youtube.com/watch?v={id}")
-                    )
+                    yt_task = asyncio.create_task(get_direct_audio_url(id))
 
-                    # Transmite silêncio DFPWM contínuo para segurar a conexão com o Minecraft
+                    # Envia silêncio DFPWM para segurar a conexão do ComputerCraft
                     while not yt_task.done():
                         yield b'\x55' * 1500
                         await asyncio.sleep(0.25)
 
-                    try:
-                        audio_url = await yt_task
-                    except Exception as yt_err:
-                        print(f"Erro na extração do YT: {yt_err}")
-                        return
+                    audio_url = await yt_task
 
                     if not audio_url:
-                        print("Nenhuma URL de stream encontrada no YouTube.")
+                        print(f"Erro: Não foi possível obter o áudio para a ID {id}")
                         return
 
                     URL_CACHE[id] = {'url': audio_url, 'timestamp': now}

@@ -7,15 +7,15 @@ import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
-from typing import Dict, Any
+from typing import Dict, Any, List
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="3.9")
+app = FastAPI(title="iPod CC API", version="4.0")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 3600
+CACHE_TTL = 2700
 YOUTUBE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
 # ============================================================
@@ -44,7 +44,6 @@ COMMON_YTDL_OPTS = {
     },
     'extractor_args': {
         'youtube': {
-            # Web primeiro para que os cookies de sessão funcionem de verdade
             'player_client': ['web', 'android'],
             'player_skip': ['webpage']
         }
@@ -54,7 +53,6 @@ COMMON_YTDL_OPTS = {
 if os.path.exists(COOKIE_FILE):
     COMMON_YTDL_OPTS['cookiefile'] = COOKIE_FILE
 
-# Validação ativa do cookie no boot do servidor
 def validate_cookies() -> bool:
     if not os.path.exists(COOKIE_FILE):
         return False
@@ -123,24 +121,36 @@ def fetch_via_invidious(video_id: str) -> str:
             continue
     return None
 
+def pick_best_audio_url(formats: List[dict]) -> str:
+    def has_real_audio(fmt):
+        acodec = fmt.get('acodec')
+        return fmt.get('url') and acodec not in (None, 'none', '')
+
+    # 1. Prioridade: áudio puro (sem vídeo) de alta qualidade
+    audio_only = [f for f in formats if has_real_audio(f) and f.get('vcodec') in (None, 'none')]
+    if audio_only:
+        audio_only.sort(key=lambda f: f.get('abr') or 0, reverse=True)
+        return audio_only[0]['url']
+
+    # 2. Fallback: formato misto que contenha áudio real válido
+    with_audio = [f for f in formats if has_real_audio(f)]
+    if with_audio:
+        with_audio.sort(key=lambda f: f.get('abr') or 0, reverse=True)
+        return with_audio[0]['url']
+
+    # 3. Nenhuma url com áudio real identificada
+    return None
+
 def fetch_via_ytdl_manual(video_id: str) -> str:
     opts = {**COMMON_YTDL_OPTS, 'skip_download': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
         if not info:
             return None
-        
-        formats = info.get('formats', [])
-        for fmt in reversed(formats):
-            if fmt.get('url') and fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':
-                return fmt['url']
-        for fmt in reversed(formats):
-            if fmt.get('url'):
-                return fmt['url']
-        return info.get('url')
+        return pick_best_audio_url(info.get('formats', []))
 
 async def get_direct_audio_url(video_id: str) -> str:
-    # 1. Tenta yt-dlp com cookies primeiro (método principal mais estável)
+    # 1. Tenta yt-dlp com cookies primeiro
     if COOKIES_VALID:
         try:
             url = await asyncio.wait_for(
@@ -151,7 +161,7 @@ async def get_direct_audio_url(video_id: str) -> str:
         except Exception as e:
             print(f"yt-dlp com cookies falhou para {video_id}: {e}")
 
-    # 2. Se falhar, dispara Piped e Invidious em paralelo
+    # 2. Se falhar, dispara Piped e Invidious em paralelo com gerenciamento de tasks órfãs
     tasks = [
         asyncio.create_task(asyncio.to_thread(fetch_via_piped, video_id)),
         asyncio.create_task(asyncio.to_thread(fetch_via_invidious, video_id)),
@@ -163,14 +173,19 @@ async def get_direct_audio_url(video_id: str) -> str:
                 result = await coro
                 if result:
                     for t in tasks:
-                        t.cancel()
+                        if not t.done():
+                            t.cancel()
                     return result
             except Exception:
                 continue
     except asyncio.TimeoutError:
         pass
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
 
-    # 3. Fallback final de segurança com yt-dlp puro
+    # 3. Fallback final com yt-dlp puro sem cookies
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(fetch_via_ytdl_manual, video_id), timeout=10
@@ -240,33 +255,29 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
 
     # MODO STREAMING (DFPWM)
     elif id:
-        # Validação estrita do ID para evitar gastar recursos do FFmpeg com lixo
         if not YOUTUBE_ID_REGEX.match(id):
             return JSONResponse(status_code=400, content={"status": "error", "message": "ID de vídeo inválido"})
+
+        now = time.time()
+        audio_url = None
+
+        # Resolução limpa ANTES de iniciar o StreamingResponse (evita HTTP 200 falso)
+        if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < CACHE_TTL:
+            audio_url = URL_CACHE[id]['url']
+        else:
+            audio_url = await get_direct_audio_url(id)
+            if audio_url:
+                URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
+
+        if not audio_url:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "message": f"Não foi possível obter áudio válido para {id}"}
+            )
 
         async def stream_bytes():
             proc = None
             try:
-                now = time.time()
-                audio_url = None
-
-                if id in URL_CACHE and (now - URL_CACHE[id]['timestamp']) < 2700:
-                    audio_url = URL_CACHE[id]['url']
-                else:
-                    yt_task = asyncio.create_task(get_direct_audio_url(id))
-
-                    while not yt_task.done():
-                        yield b'\x55' * 1500
-                        await asyncio.sleep(0.25)
-
-                    audio_url = await yt_task
-
-                    if not audio_url:
-                        print(f"Erro: Não foi possível obter o link direto para a ID {id}")
-                        return
-
-                    URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
-
                 ffmpeg_cmd = [
                     'ffmpeg',
                     '-reconnect', '1',

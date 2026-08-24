@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="3.6")
+app = FastAPI(title="iPod CC API", version="3.7")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
@@ -24,26 +24,25 @@ COOKIE_FILE = "cookies.txt"
 if os.path.exists(COOKIE_FILE):
     print(">>> SUCESSO: Arquivo cookies.txt encontrado na raiz do projeto!")
 else:
-    print(">>> AVISO: cookies.txt NÃO foi encontrado. O yt-dlp pode falhar.")
-    # Se houver variável no ambiente como backup
+    print(">>> AVISO: cookies.txt NÃO foi encontrado na raiz.")
     if os.environ.get("YT_COOKIES"):
         raw_cookies = os.environ.get("YT_COOKIES").replace('\\n', '\n').replace('\r', '')
         with open(COOKIE_FILE, "w", encoding="utf-8") as f:
             f.write(raw_cookies)
-        print(">>> Cookie gerado através da variável de ambiente do Render.")
+        print(">>> Cookie gerado através da variável de ambiente.")
 
 COMMON_YTDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'socket_timeout': 15,
     'format': 'all',
-    # Engana o YT fingindo ser um navegador Chrome desktop comum
     'http_headers': {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
     },
     'extractor_args': {
         'youtube': {
+            # Força o uso do cliente Android/iOS juntamente com o cookie para bypass de bot
             'player_client': ['android', 'ios']
         }
     }
@@ -53,7 +52,7 @@ if os.path.exists(COOKIE_FILE):
     COMMON_YTDL_OPTS['cookiefile'] = COOKIE_FILE
 
 # ============================================================
-# LISTAS DE PROXIES (Piped e Invidious atualizados)
+# LISTAS DE PROXIES (Piped e Invidious)
 # ============================================================
 PIPED_INSTANCES = [
     "https://api.piped.video",
@@ -75,7 +74,7 @@ BROWSER_HEADERS = {
 }
 
 # ============================================================
-# EXTRAÇÃO DE ÁUDIO (PIPED -> INVIDIOUS -> YTDL)
+# EXTRAÇÃO DE ÁUDIO (PIPED -> INVIDIOUS -> YTDL COM COOKIE)
 # ============================================================
 
 def fetch_via_piped(video_id: str) -> str:
@@ -123,19 +122,19 @@ def fetch_via_ytdl_manual(video_id: str) -> str:
         return info.get('url')
 
 async def get_direct_audio_url(video_id: str) -> str:
-    # 1. Piped
+    # 1. Tenta Piped
     url = await asyncio.to_thread(fetch_via_piped, video_id)
     if url: return url
 
-    # 2. Invidious
+    # 2. Tenta Invidious
     url = await asyncio.to_thread(fetch_via_invidious, video_id)
     if url: return url
 
-    # 3. yt-dlp blindado com cookies e user-agent de desktop
+    # 3. Fallback definitivo com yt-dlp usando o cookies.txt físico da raiz
     try:
         return await asyncio.to_thread(fetch_via_ytdl_manual, video_id)
     except Exception as e:
-        print(f"Erro fatal no fallback do yt-dlp para {video_id}: {e}")
+        print(f"Erro fatal no yt-dlp para {video_id}: {e}")
         return None
 
 # ============================================================

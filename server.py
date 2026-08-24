@@ -7,26 +7,23 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="2.4")
+app = FastAPI(title="iPod CC API", version="2.5")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
 
-# Se você definir a variável YT_COOKIES no Render, ele cria o arquivo automaticamente
 COOKIE_FILE = "cookies.txt"
 if os.environ.get("YT_COOKIES"):
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         f.write(os.environ.get("YT_COOKIES"))
 
-# Configurações de bypass para evitar bloqueio por IP de DataCenter
 COMMON_YTDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'socket_timeout': 10,
-    # Bypassa a checagem de bot simulando requisições de iOS/Android
     'extractor_args': {
         'youtube': {
-            'player_client': ['ios', 'android', 'mweb']
+            'player_client': ['tv_embedded', 'android_vr', 'ios', 'mweb']
         }
     }
 }
@@ -40,9 +37,10 @@ YTDL_SEARCH_OPTS = {
     'skip_download': True,
 }
 
+# 'bestaudio/ba/b/best' garante fallback para streams de vídeo+áudio se áudio puro não estiver disponível
 YTDL_STREAM_OPTS = {
     **COMMON_YTDL_OPTS,
-    'format': 'ba/ba*',
+    'format': 'bestaudio/ba/b/best',
     'skip_download': True,
     'youtube_include_dash_manifest': False,
     'youtube_include_hls_manifest': False,
@@ -128,13 +126,21 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                         fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
                     )
 
-                    # Envia pacotes continuos de silêncio (DFPWM) para preencher o buffer
+                    # Preenche o buffer com silêncio DFPWM enquanto busca no YT
                     while not yt_task.done():
                         yield b'\x55' * 1500
                         await asyncio.sleep(0.25)
 
-                    info = await yt_task
-                    audio_url = info['url']
+                    try:
+                        info = await yt_task
+                        audio_url = info.get('url') if info else None
+                    except Exception as yt_err:
+                        print(f"Erro na extração do YT: {yt_err}")
+                        return
+
+                    if not audio_url:
+                        return
+
                     URL_CACHE[id] = {'url': audio_url, 'timestamp': now}
 
                 ffmpeg_cmd = [

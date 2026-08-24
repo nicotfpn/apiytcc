@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
-app = FastAPI(title="iPod CC API", version="2.5")
+app = FastAPI(title="iPod CC API", version="2.6")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 3600
@@ -23,7 +23,7 @@ COMMON_YTDL_OPTS = {
     'socket_timeout': 10,
     'extractor_args': {
         'youtube': {
-            'player_client': ['tv_embedded', 'android_vr', 'ios', 'mweb']
+            'player_client': ['android', 'ios', 'mweb', 'web']
         }
     }
 }
@@ -37,18 +37,37 @@ YTDL_SEARCH_OPTS = {
     'skip_download': True,
 }
 
-# 'bestaudio/ba/b/best' garante fallback para streams de vídeo+áudio se áudio puro não estiver disponível
 YTDL_STREAM_OPTS = {
     **COMMON_YTDL_OPTS,
-    'format': 'bestaudio/ba/b/best',
     'skip_download': True,
     'youtube_include_dash_manifest': False,
     'youtube_include_hls_manifest': False,
 }
 
-async def fetch_yt_info(target: str, opts: dict) -> dict:
+async def fetch_yt_stream_url(video_url: str) -> str:
+    """Extrai a URL direta do stream sem quebrar por falta de formato específico."""
     def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(YTDL_STREAM_OPTS) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            if not info:
+                return None
+            
+            # 1. Retorna a URL principal se selecionada pelo yt-dlp
+            if info.get('url'):
+                return info['url']
+            
+            # 2. Fallback: varre a lista de formatos e pega a primeira URL de stream válida
+            formats = info.get('formats', [])
+            for fmt in reversed(formats):
+                if fmt.get('url'):
+                    return fmt['url']
+            return None
+
+    return await asyncio.to_thread(_extract)
+
+async def fetch_yt_search(target: str) -> dict:
+    def _extract():
+        with yt_dlp.YoutubeDL(YTDL_SEARCH_OPTS) as ydl:
             return ydl.extract_info(target, download=False)
     return await asyncio.to_thread(_extract)
 
@@ -66,7 +85,7 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
             is_url = search.startswith("http://") or search.startswith("https://")
             target = search if is_url else f"ytsearch5:{search}"
             
-            info = await fetch_yt_info(target, YTDL_SEARCH_OPTS)
+            info = await fetch_yt_search(target)
             results = [{"status": "ok"}]
 
             if info:
@@ -123,22 +142,22 @@ async def handle_request(request: Request, search: str = None, id: str = None, v
                     audio_url = URL_CACHE[id]['url']
                 else:
                     yt_task = asyncio.create_task(
-                        fetch_yt_info(f"https://www.youtube.com/watch?v={id}", YTDL_STREAM_OPTS)
+                        fetch_yt_stream_url(f"https://www.youtube.com/watch?v={id}")
                     )
 
-                    # Preenche o buffer com silêncio DFPWM enquanto busca no YT
+                    # Transmite silêncio DFPWM contínuo para segurar a conexão com o Minecraft
                     while not yt_task.done():
                         yield b'\x55' * 1500
                         await asyncio.sleep(0.25)
 
                     try:
-                        info = await yt_task
-                        audio_url = info.get('url') if info else None
+                        audio_url = await yt_task
                     except Exception as yt_err:
                         print(f"Erro na extração do YT: {yt_err}")
                         return
 
                     if not audio_url:
+                        print("Nenhuma URL de stream encontrada no YouTube.")
                         return
 
                     URL_CACHE[id] = {'url': audio_url, 'timestamp': now}

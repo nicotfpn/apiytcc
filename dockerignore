@@ -1,0 +1,10 @@
+cookies.txt
+.env
+.env.*
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.log
+ipod_state.json

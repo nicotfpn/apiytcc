@@ -76,6 +76,14 @@ def prepare_cookie_file() -> bool:
 
 HAS_COOKIES = prepare_cookie_file()
 
+try:
+    import yt_dlp_ejs
+    print(">>> yt-dlp EJS disponivel.")
+except Exception:
+    print(">>> AVISO: yt-dlp EJS nao encontrado.")
+
+print(">>> Runtime JS configurado: Node 22")
+
 
 def make_ytdl_opts(
     *,
@@ -98,6 +106,15 @@ def make_ytdl_opts(
         "no_warnings": True,
         "socket_timeout": timeout,
         "skip_download": True,
+
+        # YouTube 2026: yt-dlp precisa de um runtime JS + EJS
+        # para resolver os challenges e liberar todos os formatos.
+        # O Docker ja usa Node 22, mas o yt-dlp nao habilita Node
+        # automaticamente; sem isso alguns formatos simplesmente somem.
+        "js_runtimes": {
+            "node": {},
+        },
+
         "http_headers": dict(BROWSER_HEADERS),
         "extractor_args": {
             "youtube": {
@@ -109,7 +126,7 @@ def make_ytdl_opts(
     if flat:
         opts["extract_flat"] = True
     else:
-        opts["format"] = "bestaudio/best"
+        opts["format"] = "bestaudio*/best*"
 
     if use_cookies and HAS_COOKIES:
         opts["cookiefile"] = COOKIE_FILE
@@ -123,6 +140,9 @@ SEARCH_YTDL_OPTS: Dict[str, Any] = {
     "socket_timeout": 10,
     "extract_flat": True,
     "skip_download": True,
+    "js_runtimes": {
+        "node": {},
+    },
     "http_headers": dict(BROWSER_HEADERS),
 }
 
@@ -445,6 +465,12 @@ async def get_direct_audio_source(video_id: str):
         attempts.append(
             ("mweb_pot_cookies", True, "mweb")
         )
+
+    # web_embedded atualmente nao depende de GVS PO Token
+    # e pode salvar videos em que o mweb nao entrega formatos uteis.
+    attempts.append(
+        ("web_embedded", False, "web_embedded")
+    )
 
     attempts.append(
         ("web_safari", False, "web_safari")

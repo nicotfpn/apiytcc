@@ -25,6 +25,8 @@ RUN git clone --depth 1 --branch "${BGUTIL_VERSION}" \
 
 WORKDIR /app
 
+RUN node --version
+
 RUN python3 -m venv /opt/venv
 
 COPY requirements.txt .

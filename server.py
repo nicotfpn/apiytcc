@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="4.3")
+app = FastAPI(title="iPod CC API", version="4.4")
 
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 600
@@ -77,7 +77,7 @@ def prepare_cookie_file() -> bool:
 HAS_COOKIES = prepare_cookie_file()
 
 try:
-    import yt_dlp_ejs
+    import yt_dlp_ejs  # noqa: F401
     print(">>> yt-dlp EJS disponivel.")
 except Exception:
     print(">>> AVISO: yt-dlp EJS nao encontrado.")
@@ -92,29 +92,14 @@ def make_ytdl_opts(
     flat: bool = False,
     timeout: int = 15,
 ) -> Dict[str, Any]:
-    """
-    O provider bgutil e descoberto automaticamente pelo yt-dlp plugin.
-
-    Fluxo principal:
-      mweb + PO Token provider
-
-    Cookies sao opcionais e usados apenas como fallback para conteudo
-    que realmente precise de sessao.
-    """
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": timeout,
         "skip_download": True,
-
-        # YouTube 2026: yt-dlp precisa de um runtime JS + EJS
-        # para resolver os challenges e liberar todos os formatos.
-        # O Docker ja usa Node 22, mas o yt-dlp nao habilita Node
-        # automaticamente; sem isso alguns formatos simplesmente somem.
         "js_runtimes": {
             "node": {},
         },
-
         "http_headers": dict(BROWSER_HEADERS),
         "extractor_args": {
             "youtube": {
@@ -126,6 +111,7 @@ def make_ytdl_opts(
     if flat:
         opts["extract_flat"] = True
     else:
+        # Aceita audio-only ou muxed com audio.
         opts["format"] = "bestaudio*/best*"
 
     if use_cookies and HAS_COOKIES:
@@ -146,8 +132,6 @@ SEARCH_YTDL_OPTS: Dict[str, Any] = {
     "http_headers": dict(BROWSER_HEADERS),
 }
 
-# Para busca, cookies so sao usados se existirem.
-# A busca flat costuma ser mais leve que extrair o player inteiro.
 if HAS_COOKIES:
     SEARCH_YTDL_OPTS["cookiefile"] = COOKIE_FILE
 
@@ -188,6 +172,7 @@ def fetch_via_piped(video_id: str):
                     "url": best.get("url"),
                     "headers": best.get("httpHeaders") or {},
                     "source": "piped",
+                    "label": "piped",
                 }
 
         except Exception:
@@ -368,6 +353,7 @@ def fetch_via_invidious(video_id: str):
                     "url": best.get("url"),
                     "headers": {},
                     "source": "invidious",
+                    "label": "invidious",
                 }
 
         except Exception:
@@ -376,7 +362,11 @@ def fetch_via_invidious(video_id: str):
     return None
 
 
-def pick_best_audio_source(info: dict):
+def pick_best_audio_source(
+    info: dict,
+    *,
+    prefer_hls: bool = False,
+):
     formats = info.get("formats", []) if info else []
 
     def has_audio(fmt):
@@ -385,6 +375,9 @@ def pick_best_audio_source(info: dict):
             and fmt.get("acodec") not in (None, "none")
         )
 
+    def protocol(fmt):
+        return str(fmt.get("protocol") or "").casefold()
+
     audio_only = [
         fmt
         for fmt in formats
@@ -392,27 +385,50 @@ def pick_best_audio_source(info: dict):
         and fmt.get("vcodec") in (None, "none")
     ]
 
-    if audio_only:
-        audio_only.sort(
-            key=lambda fmt: fmt.get("abr") or 0,
-            reverse=True,
-        )
-        best = audio_only[0]
-    else:
-        with_audio = [
+    with_audio = [
+        fmt
+        for fmt in formats
+        if has_audio(fmt)
+    ]
+
+    if prefer_hls:
+        preferred = [
             fmt
-            for fmt in formats
-            if has_audio(fmt)
+            for fmt in audio_only
+            if protocol(fmt).startswith("m3u8")
         ]
 
-        if not with_audio:
-            return None
+        if not preferred:
+            preferred = [
+                fmt
+                for fmt in with_audio
+                if protocol(fmt).startswith("m3u8")
+            ]
+    else:
+        preferred = [
+            fmt
+            for fmt in audio_only
+            if protocol(fmt) in ("http", "https")
+        ]
 
-        with_audio.sort(
-            key=lambda fmt: fmt.get("abr") or 0,
-            reverse=True,
-        )
-        best = with_audio[0]
+        if not preferred:
+            preferred = audio_only
+
+    if not preferred:
+        preferred = with_audio
+
+    if not preferred:
+        return None
+
+    preferred.sort(
+        key=lambda fmt: (
+            fmt.get("abr") or 0,
+            fmt.get("asr") or 0,
+        ),
+        reverse=True,
+    )
+
+    best = preferred[0]
 
     return {
         "url": best.get("url"),
@@ -422,6 +438,9 @@ def pick_best_audio_source(info: dict):
             or {}
         ),
         "source": "yt-dlp",
+        "format_id": best.get("format_id"),
+        "protocol": best.get("protocol"),
+        "ext": best.get("ext"),
     }
 
 
@@ -444,37 +463,130 @@ def fetch_via_ytdl(
             download=False,
         )
 
-    return pick_best_audio_source(info)
+    source = pick_best_audio_source(
+        info,
+        prefer_hls=(player_client == "web_safari"),
+    )
+
+    if source:
+        source["client"] = player_client
+
+    return source
+
+
+def build_ffmpeg_input_args(source: Dict[str, Any]) -> List[str]:
+    args = [
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_at_eof",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_delay_max",
+        "10",
+        "-rw_timeout",
+        "15000000",
+    ]
+
+    input_headers = source.get("headers") or {}
+
+    if input_headers:
+        header_lines = [
+            f"{key}: {value}"
+            for key, value in input_headers.items()
+            if value is not None
+        ]
+
+        if header_lines:
+            args += [
+                "-headers",
+                "\r\n".join(header_lines) + "\r\n",
+            ]
+
+    args += [
+        "-i",
+        source["url"],
+    ]
+
+    return args
+
+
+def probe_audio_source(source: Dict[str, Any]) -> bool:
+    """
+    Testa a URL antes de devolver HTTP 200 ao cliente.
+
+    O FFmpeg abre a fonte e processa um pedacinho curto.
+    Se falhar, a API tenta o proximo cliente/fallback.
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+
+    cmd += build_ffmpeg_input_args(source)
+
+    cmd += [
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-t",
+        "0.30",
+        "-f",
+        "null",
+        "-",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+
+        return result.returncode == 0
+
+    except Exception:
+        return False
 
 
 async def get_direct_audio_source(video_id: str):
     """
-    Ordem:
-      1) mweb + PO Token, sem cookies
-      2) mweb + PO Token, com cookies (se houver)
-      3) web_safari sem cookies
-      4) Piped/Invidious
+    A extracao so vira OK depois que o FFmpeg consegue abrir a URL.
 
-    O passo 1 evita depender da conta para videos publicos.
+    Isso evita:
+        yt-dlp OK
+        HTTP 200
+        download parcial
+        FFmpeg codigo 1
     """
     attempts = [
         ("mweb_pot", False, "mweb"),
+        ("web_safari_hls", False, "web_safari"),
+        ("web_embedded", False, "web_embedded"),
     ]
 
     if HAS_COOKIES:
-        attempts.append(
-            ("mweb_pot_cookies", True, "mweb")
+        attempts.extend(
+            [
+                (
+                    "web_safari_hls_cookies",
+                    True,
+                    "web_safari",
+                ),
+                (
+                    "mweb_pot_cookies",
+                    True,
+                    "mweb",
+                ),
+            ]
         )
-
-    # web_embedded atualmente nao depende de GVS PO Token
-    # e pode salvar videos em que o mweb nao entrega formatos uteis.
-    attempts.append(
-        ("web_embedded", False, "web_embedded")
-    )
-
-    attempts.append(
-        ("web_safari", False, "web_safari")
-    )
 
     last_error: Optional[Exception] = None
 
@@ -487,31 +599,43 @@ async def get_direct_audio_source(video_id: str):
                     use_cookies=use_cookies,
                     player_client=client,
                 ),
-                timeout=15,
+                timeout=18,
             )
 
             if source and source.get("url"):
-                print(
-                    f">>> [AUDIO] yt-dlp {label} OK "
-                    f"para {video_id}"
+                source["label"] = label
+
+                playable = await asyncio.to_thread(
+                    probe_audio_source,
+                    source,
                 )
-                return source
+
+                if playable:
+                    print(
+                        f">>> [AUDIO] {label} OK "
+                        f"para {video_id}"
+                    )
+                    return source
+
+                print(
+                    f">>> [AUDIO] {label} extraido, "
+                    f"mas a URL nao abriu; tentando fallback"
+                )
 
         except Exception as exc:
             last_error = exc
 
             if is_bot_check_error(exc):
                 print(
-                    f">>> [YOUTUBE] bloqueio/PO token em "
+                    f">>> [YOUTUBE] bloqueio em "
                     f"{label} para {video_id}"
                 )
             else:
                 print(
-                    f">>> [AUDIO] yt-dlp {label} falhou "
+                    f">>> [AUDIO] {label} falhou "
                     f"para {video_id}: {exc}"
                 )
 
-            # Evita martelar o YouTube em sequencia.
             await asyncio.sleep(0.75)
 
     tasks = [
@@ -532,12 +656,18 @@ async def get_direct_audio_source(video_id: str):
                 result = await coro
 
                 if result and result.get("url"):
-                    print(
-                        f">>> [AUDIO] fallback "
-                        f"{result.get('source')} OK "
-                        f"para {video_id}"
+                    playable = await asyncio.to_thread(
+                        probe_audio_source,
+                        result,
                     )
-                    return result
+
+                    if playable:
+                        print(
+                            f">>> [AUDIO] fallback "
+                            f"{result.get('source')} OK "
+                            f"para {video_id}"
+                        )
+                        return result
 
             except Exception:
                 continue
@@ -558,7 +688,7 @@ async def get_direct_audio_source(video_id: str):
     else:
         print(
             f">>> [ERRO] Nenhuma fonte de audio "
-            f"funcionou para {video_id}"
+            f"reproduzivel para {video_id}"
         )
 
     return None
@@ -747,7 +877,7 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "4.3-pot",
+                "backend": "4.4-pot-ejs-probe",
             }
         )
 
@@ -784,10 +914,28 @@ async def handle_request(
         if cached and (
             now - cached["timestamp"]
         ) < CACHE_TTL:
-            audio_source = cached["source"]
-        else:
+            candidate = cached["source"]
+
+            # Mesmo cache e revalidado. URL do GoogleVideo pode morrer
+            # antes dos 10 minutos.
+            playable = await asyncio.to_thread(
+                probe_audio_source,
+                candidate,
+            )
+
+            if playable:
+                audio_source = candidate
+            else:
+                URL_CACHE.pop(id, None)
+                print(
+                    f">>> [CACHE] fonte expirada removida "
+                    f"para {id}"
+                )
+
+        if audio_source is None:
             audio_source = await get_direct_audio_source(id)
 
+            # IMPORTANTE: so entra no cache depois do probe passar.
             if audio_source and audio_source.get("url"):
                 URL_CACHE[id] = {
                     "source": audio_source,
@@ -804,7 +952,7 @@ async def handle_request(
                     "status": "error",
                     "message": (
                         "Nao foi possivel obter audio "
-                        f"valido para {id}"
+                        f"reproduzivel para {id}"
                     ),
                 },
             )
@@ -818,44 +966,13 @@ async def handle_request(
                     "-hide_banner",
                     "-loglevel",
                     "error",
-                    "-reconnect",
-                    "1",
-                    "-reconnect_streamed",
-                    "1",
-                    "-reconnect_at_eof",
-                    "1",
-                    "-reconnect_on_network_error",
-                    "1",
-                    "-reconnect_delay_max",
-                    "10",
-                    "-rw_timeout",
-                    "15000000",
                 ]
 
-                input_headers = (
-                    audio_source.get("headers")
-                    or {}
+                ffmpeg_cmd += build_ffmpeg_input_args(
+                    audio_source
                 )
 
-                if input_headers:
-                    header_lines = [
-                        f"{key}: {value}"
-                        for key, value
-                        in input_headers.items()
-                        if value is not None
-                    ]
-
-                    if header_lines:
-                        ffmpeg_cmd += [
-                            "-headers",
-                            "\r\n".join(
-                                header_lines
-                            ) + "\r\n",
-                        ]
-
                 ffmpeg_cmd += [
-                    "-i",
-                    audio_source["url"],
                     "-map",
                     "0:a:0?",
                     "-vn",
@@ -884,10 +1001,17 @@ async def handle_request(
 
                     if not chunk:
                         if proc.poll() is not None:
-                            print(
-                                f">>> [FFMPEG] codigo "
-                                f"{proc.returncode} para {id}"
-                            )
+                            if proc.returncode != 0:
+                                URL_CACHE.pop(id, None)
+                                print(
+                                    f">>> [FFMPEG] fonte falhou "
+                                    f"para {id}; cache removido"
+                                )
+                            else:
+                                print(
+                                    f">>> [FFMPEG] finalizado "
+                                    f"para {id}"
+                                )
                         break
 
                     yield chunk
@@ -896,6 +1020,7 @@ async def handle_request(
                 pass
 
             except Exception as exc:
+                URL_CACHE.pop(id, None)
                 print(
                     f">>> [STREAM] erro para {id}: {exc}"
                 )

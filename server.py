@@ -560,6 +560,13 @@ async def get_direct_audio_source(video_id: str):
     """
     A extracao so vira OK depois que o FFmpeg consegue abrir a URL.
 
+    Ordem principal otimizada:
+        1) web_embedded
+        2) mweb + PO Token
+        3) web_safari HLS
+        4) fallbacks com cookies
+        5) Piped / Invidious
+
     Isso evita:
         yt-dlp OK
         HTTP 200
@@ -567,9 +574,9 @@ async def get_direct_audio_source(video_id: str):
         FFmpeg codigo 1
     """
     attempts = [
+        ("web_embedded", False, "web_embedded"),
         ("mweb_pot", False, "mweb"),
         ("web_safari_hls", False, "web_safari"),
-        ("web_embedded", False, "web_embedded"),
     ]
 
     if HAS_COOKIES:

@@ -4,6 +4,8 @@ import json
 import re
 import asyncio
 import subprocess
+import sys
+import tempfile
 import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,10 +16,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="4.4")
+app = FastAPI(title="iPod CC API", version="4.5")
 
-URL_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 600
+CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
+CLIENT_CACHE_TTL = 1800
 
 YOUTUBE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
@@ -474,229 +476,492 @@ def fetch_via_ytdl(
     return source
 
 
-def build_ffmpeg_input_args(source: Dict[str, Any]) -> List[str]:
-    args = [
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_at_eof",
-        "1",
-        "-reconnect_on_network_error",
-        "1",
-        "-reconnect_delay_max",
-        "10",
-        "-rw_timeout",
-        "15000000",
-    ]
 
-    input_headers = source.get("headers") or {}
-
-    if input_headers:
-        header_lines = [
-            f"{key}: {value}"
-            for key, value in input_headers.items()
-            if value is not None
-        ]
-
-        if header_lines:
-            args += [
-                "-headers",
-                "\r\n".join(header_lines) + "\r\n",
-            ]
-
-    args += [
-        "-i",
-        source["url"],
-    ]
-
-    return args
-
-
-def probe_audio_source(source: Dict[str, Any]) -> bool:
+def stream_attempts() -> List[Dict[str, Any]]:
     """
-    Testa a URL antes de devolver HTTP 200 ao cliente.
+    Ordem conservadora.
 
-    O FFmpeg abre a fonte e processa um pedacinho curto.
-    Se falhar, a API tenta o proximo cliente/fallback.
+    web_embedded:
+        Nao precisa de GVS PO Token, quando o video permite embed.
+
+    mweb:
+        Usa o BgUtil PO Token Provider que ja esta rodando no container.
+
+    android_vr:
+        Cliente sem GVS PO Token para a maioria dos videos comuns.
+
+    web_safari:
+        Preferimos HLS, que atualmente e a parte mais util desse cliente.
     """
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-
-    cmd += build_ffmpeg_input_args(source)
-
-    cmd += [
-        "-map",
-        "0:a:0?",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-t",
-        "0.30",
-        "-f",
-        "null",
-        "-",
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=8,
-        )
-
-        return result.returncode == 0
-
-    except Exception:
-        return False
-
-
-async def get_direct_audio_source(video_id: str):
-    """
-    A extracao so vira OK depois que o FFmpeg consegue abrir a URL.
-
-    Ordem principal otimizada:
-        1) web_embedded
-        2) mweb + PO Token
-        3) web_safari HLS
-        4) fallbacks com cookies
-        5) Piped / Invidious
-
-    Isso evita:
-        yt-dlp OK
-        HTTP 200
-        download parcial
-        FFmpeg codigo 1
-    """
-    attempts = [
-        ("web_embedded", False, "web_embedded"),
-        ("mweb_pot", False, "mweb"),
-        ("web_safari_hls", False, "web_safari"),
+    attempts: List[Dict[str, Any]] = [
+        {
+            "label": "web_embedded",
+            "client": "web_embedded",
+            "cookies": False,
+            "format": "bestaudio*/best*",
+        },
+        {
+            "label": "mweb_pot",
+            "client": "mweb",
+            "cookies": False,
+            "format": "bestaudio*/best*",
+        },
+        {
+            "label": "android_vr",
+            "client": "android_vr",
+            "cookies": False,
+            "format": "bestaudio*/best*",
+        },
+        {
+            "label": "web_safari_hls",
+            "client": "web_safari",
+            "cookies": False,
+            "format": (
+                "bestaudio[protocol^=m3u8]/"
+                "best[protocol^=m3u8]/"
+                "bestaudio*/best*"
+            ),
+        },
     ]
 
     if HAS_COOKIES:
         attempts.extend(
             [
-                (
-                    "web_safari_hls_cookies",
-                    True,
-                    "web_safari",
-                ),
-                (
-                    "mweb_pot_cookies",
-                    True,
-                    "mweb",
-                ),
+                {
+                    "label": "mweb_pot_cookies",
+                    "client": "mweb",
+                    "cookies": True,
+                    "format": "bestaudio*/best*",
+                },
+                {
+                    "label": "web_safari_hls_cookies",
+                    "client": "web_safari",
+                    "cookies": True,
+                    "format": (
+                        "bestaudio[protocol^=m3u8]/"
+                        "best[protocol^=m3u8]/"
+                        "bestaudio*/best*"
+                    ),
+                },
             ]
         )
 
-    last_error: Optional[Exception] = None
+    return attempts
 
-    for label, use_cookies, client in attempts:
-        try:
-            source = await asyncio.wait_for(
-                asyncio.to_thread(
-                    fetch_via_ytdl,
-                    video_id,
-                    use_cookies=use_cookies,
-                    player_client=client,
-                ),
-                timeout=18,
-            )
 
-            if source and source.get("url"):
-                source["label"] = label
+def ordered_stream_attempts(video_id: str) -> List[Dict[str, Any]]:
+    attempts = stream_attempts()
 
-                playable = await asyncio.to_thread(
-                    probe_audio_source,
-                    source,
-                )
+    cached = CLIENT_CACHE.get(video_id)
 
-                if playable:
-                    print(
-                        f">>> [AUDIO] {label} OK "
-                        f"para {video_id}"
-                    )
-                    return source
+    if (
+        cached
+        and time.time() - cached.get("timestamp", 0) < CLIENT_CACHE_TTL
+    ):
+        cached_label = cached.get("label")
 
-                print(
-                    f">>> [AUDIO] {label} extraido, "
-                    f"mas a URL nao abriu; tentando fallback"
-                )
+        attempts.sort(
+            key=lambda item: 0 if item["label"] == cached_label else 1
+        )
 
-        except Exception as exc:
-            last_error = exc
+    return attempts
 
-            if is_bot_check_error(exc):
-                print(
-                    f">>> [YOUTUBE] bloqueio em "
-                    f"{label} para {video_id}"
-                )
-            else:
-                print(
-                    f">>> [AUDIO] {label} falhou "
-                    f"para {video_id}: {exc}"
-                )
 
-            await asyncio.sleep(0.75)
+def build_ytdlp_pipe_command(
+    video_id: str,
+    attempt: Dict[str, Any],
+) -> List[str]:
+    """
+    IMPORTANTE:
+    yt-dlp faz a requisicao real do media e escreve os bytes em stdout.
 
-    tasks = [
-        asyncio.create_task(
-            asyncio.to_thread(fetch_via_piped, video_id)
-        ),
-        asyncio.create_task(
-            asyncio.to_thread(fetch_via_invidious, video_id)
-        ),
+    Nao entregamos mais uma URL GoogleVideo para o FFmpeg abrir sozinho.
+    Assim retries, fragments, cookies, PO Token e challenge handling
+    continuam sob controle do proprio yt-dlp.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--quiet",
+        "--no-warnings",
+        "--no-progress",
+        "--no-playlist",
+        "--js-runtimes",
+        "node",
+        "--extractor-args",
+        f"youtube:player_client={attempt['client']}",
+        "--format",
+        attempt["format"],
+        "--output",
+        "-",
+        "--retries",
+        "6",
+        "--fragment-retries",
+        "6",
+        "--extractor-retries",
+        "3",
+        "--file-access-retries",
+        "3",
+        "--retry-sleep",
+        "1",
+        "--socket-timeout",
+        "15",
     ]
 
+    if attempt.get("cookies") and HAS_COOKIES:
+        cmd += [
+            "--cookies",
+            COOKIE_FILE,
+        ]
+
+    cmd.append(
+        f"https://www.youtube.com/watch?v={video_id}"
+    )
+
+    return cmd
+
+
+def build_ffmpeg_pipe_command() -> List[str]:
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-f",
+        "dfpwm",
+        "-ar",
+        "48000",
+        "-ac",
+        "1",
+        "pipe:1",
+    ]
+
+
+def read_error_tail(handle, limit: int = 1200) -> str:
     try:
-        for coro in asyncio.as_completed(
-            tasks,
-            timeout=7,
-        ):
+        handle.flush()
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - limit))
+        raw = handle.read()
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+
+        lines = [
+            line.strip()
+            for line in str(raw).splitlines()
+            if line.strip()
+        ]
+
+        if not lines:
+            return ""
+
+        return lines[-1][:300]
+
+    except Exception:
+        return ""
+
+
+def stop_pipeline(pipeline: Optional[Dict[str, Any]]) -> None:
+    if not pipeline:
+        return
+
+    ffmpeg = pipeline.get("ffmpeg")
+    ytdlp = pipeline.get("ytdlp")
+
+    for proc in (ffmpeg, ytdlp):
+        if proc and proc.poll() is None:
             try:
-                result = await coro
-
-                if result and result.get("url"):
-                    playable = await asyncio.to_thread(
-                        probe_audio_source,
-                        result,
-                    )
-
-                    if playable:
-                        print(
-                            f">>> [AUDIO] fallback "
-                            f"{result.get('source')} OK "
-                            f"para {video_id}"
-                        )
-                        return result
-
+                proc.terminate()
             except Exception:
-                continue
+                pass
+
+    for proc in (ffmpeg, ytdlp):
+        if proc and proc.poll() is None:
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    if ffmpeg and ffmpeg.stdout:
+        try:
+            ffmpeg.stdout.close()
+        except Exception:
+            pass
+
+    for key in ("ytdlp_err", "ffmpeg_err"):
+        handle = pipeline.get(key)
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def start_ytdlp_ffmpeg_pipeline(
+    video_id: str,
+    attempt: Dict[str, Any],
+) -> Dict[str, Any]:
+    ytdlp_err = tempfile.TemporaryFile()
+    ffmpeg_err = tempfile.TemporaryFile()
+
+    ytdlp = subprocess.Popen(
+        build_ytdlp_pipe_command(video_id, attempt),
+        stdout=subprocess.PIPE,
+        stderr=ytdlp_err,
+        bufsize=0,
+    )
+
+    if ytdlp.stdout is None:
+        ytdlp.terminate()
+        ytdlp_err.close()
+        ffmpeg_err.close()
+        raise RuntimeError("yt-dlp sem stdout")
+
+    ffmpeg = subprocess.Popen(
+        build_ffmpeg_pipe_command(),
+        stdin=ytdlp.stdout,
+        stdout=subprocess.PIPE,
+        stderr=ffmpeg_err,
+        bufsize=0,
+    )
+
+    # O FFmpeg agora possui o descritor de leitura.
+    # Fechar a copia do processo pai e importante para EOF/SIGPIPE.
+    ytdlp.stdout.close()
+
+    return {
+        "label": attempt["label"],
+        "attempt": attempt,
+        "ytdlp": ytdlp,
+        "ffmpeg": ffmpeg,
+        "ytdlp_err": ytdlp_err,
+        "ffmpeg_err": ffmpeg_err,
+        "first_chunk": b"",
+    }
+
+
+async def read_pipeline_chunk(
+    pipeline: Dict[str, Any],
+    size: int,
+    timeout: float,
+) -> bytes:
+    ffmpeg = pipeline["ffmpeg"]
+
+    if ffmpeg.stdout is None:
+        return b""
+
+    reader = getattr(ffmpeg.stdout, "read1", None)
+
+    if reader is None:
+        reader = ffmpeg.stdout.read
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(reader, size),
+            timeout=timeout,
+        )
 
     except asyncio.TimeoutError:
-        pass
+        return b""
 
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
 
-    if last_error and is_bot_check_error(last_error):
-        print(
-            f">>> [ERRO] YouTube recusou todas as "
-            f"tentativas para {video_id}"
+async def open_stream_pipeline(video_id: str):
+    """
+    So devolve sucesso depois que DFPWM real saiu do FFmpeg.
+
+    Isso significa que o HTTP 200 nao e enviado apenas porque o yt-dlp
+    encontrou uma URL. Primeiro precisamos receber bytes reproduziveis.
+    """
+    attempts = ordered_stream_attempts(video_id)
+
+    # Duas passadas. A segunda gera uma extracao/token/sessao nova.
+    # Isso cobre falhas intermitentes sem ficar em loop infinito.
+    for round_number in (1, 2):
+        for attempt in attempts:
+            pipeline = None
+
+            try:
+                pipeline = await asyncio.to_thread(
+                    start_ytdlp_ffmpeg_pipeline,
+                    video_id,
+                    attempt,
+                )
+
+                first_chunk = await read_pipeline_chunk(
+                    pipeline,
+                    size=2048,
+                    timeout=22,
+                )
+
+                if first_chunk:
+                    pipeline["first_chunk"] = first_chunk
+
+                    CLIENT_CACHE[video_id] = {
+                        "label": attempt["label"],
+                        "timestamp": time.time(),
+                    }
+
+                    print(
+                        f">>> [AUDIO] {attempt['label']} OK "
+                        f"para {video_id}"
+                    )
+
+                    return pipeline
+
+                ytdlp_reason = read_error_tail(
+                    pipeline["ytdlp_err"]
+                )
+                ffmpeg_reason = read_error_tail(
+                    pipeline["ffmpeg_err"]
+                )
+
+                reason = ffmpeg_reason or ytdlp_reason
+
+                if reason:
+                    print(
+                        f">>> [AUDIO] {attempt['label']} falhou: "
+                        f"{reason}"
+                    )
+                else:
+                    print(
+                        f">>> [AUDIO] {attempt['label']} falhou "
+                        f"antes de gerar audio"
+                    )
+
+            except Exception as exc:
+                print(
+                    f">>> [AUDIO] {attempt['label']} falhou: "
+                    f"{str(exc)[:300]}"
+                )
+
+            finally:
+                if pipeline and not pipeline.get("first_chunk"):
+                    stop_pipeline(pipeline)
+
+        if round_number == 1:
+            print(
+                f">>> [AUDIO] nova tentativa com extracao fresca "
+                f"para {video_id}"
+            )
+            await asyncio.sleep(1.0)
+
+    # Ultima chance: Piped/Invidious antigos.
+    fallback_sources = await asyncio.gather(
+        asyncio.to_thread(fetch_via_piped, video_id),
+        asyncio.to_thread(fetch_via_invidious, video_id),
+        return_exceptions=True,
+    )
+
+    for source in fallback_sources:
+        if isinstance(source, Exception):
+            continue
+
+        if not source or not source.get("url"):
+            continue
+
+        direct_err = tempfile.TemporaryFile()
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_at_eof",
+            "1",
+            "-reconnect_on_network_error",
+            "1",
+            "-reconnect_delay_max",
+            "10",
+        ]
+
+        headers = source.get("headers") or {}
+
+        if headers:
+            header_lines = [
+                f"{key}: {value}"
+                for key, value in headers.items()
+                if value is not None
+            ]
+
+            if header_lines:
+                ffmpeg_cmd += [
+                    "-headers",
+                    "\r\n".join(header_lines) + "\r\n",
+                ]
+
+        ffmpeg_cmd += [
+            "-i",
+            source["url"],
+            "-map",
+            "0:a:0?",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-f",
+            "dfpwm",
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "pipe:1",
+        ]
+
+        ffmpeg = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=direct_err,
+            bufsize=0,
         )
-    else:
-        print(
-            f">>> [ERRO] Nenhuma fonte de audio "
-            f"reproduzivel para {video_id}"
+
+        pipeline = {
+            "label": source.get("source") or "fallback",
+            "attempt": None,
+            "ytdlp": None,
+            "ffmpeg": ffmpeg,
+            "ytdlp_err": None,
+            "ffmpeg_err": direct_err,
+            "first_chunk": b"",
+        }
+
+        first_chunk = await read_pipeline_chunk(
+            pipeline,
+            size=2048,
+            timeout=12,
         )
+
+        if first_chunk:
+            pipeline["first_chunk"] = first_chunk
+
+            print(
+                f">>> [AUDIO] fallback "
+                f"{pipeline['label']} OK para {video_id}"
+            )
+
+            return pipeline
+
+        stop_pipeline(pipeline)
+
+    print(
+        f">>> [ERRO] Nenhuma fonte conseguiu gerar audio "
+        f"para {video_id}"
+    )
 
     return None
 
@@ -884,7 +1149,7 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "4.4-pot-ejs-probe",
+                "backend": "4.5-ytdlp-pipe",
             }
         )
 
@@ -913,112 +1178,39 @@ async def handle_request(
                 },
             )
 
-        now = time.time()
-        audio_source = None
+        # O pipeline e aberto ANTES do StreamingResponse.
+        # Portanto o cliente so recebe HTTP 200 depois que DFPWM real
+        # saiu do FFmpeg.
+        pipeline = await open_stream_pipeline(id)
 
-        cached = URL_CACHE.get(id)
-
-        if cached and (
-            now - cached["timestamp"]
-        ) < CACHE_TTL:
-            candidate = cached["source"]
-
-            # Mesmo cache e revalidado. URL do GoogleVideo pode morrer
-            # antes dos 10 minutos.
-            playable = await asyncio.to_thread(
-                probe_audio_source,
-                candidate,
-            )
-
-            if playable:
-                audio_source = candidate
-            else:
-                URL_CACHE.pop(id, None)
-                print(
-                    f">>> [CACHE] fonte expirada removida "
-                    f"para {id}"
-                )
-
-        if audio_source is None:
-            audio_source = await get_direct_audio_source(id)
-
-            # IMPORTANTE: so entra no cache depois do probe passar.
-            if audio_source and audio_source.get("url"):
-                URL_CACHE[id] = {
-                    "source": audio_source,
-                    "timestamp": now,
-                }
-
-        if (
-            not audio_source
-            or not audio_source.get("url")
-        ):
+        if not pipeline:
             return JSONResponse(
                 status_code=502,
                 content={
                     "status": "error",
                     "message": (
-                        "Nao foi possivel obter audio "
-                        f"reproduzivel para {id}"
+                        "Nao foi possivel gerar audio "
+                        f"para {id}"
                     ),
                 },
             )
 
         async def stream_bytes():
-            proc = None
-
             try:
-                ffmpeg_cmd = [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                ]
+                first_chunk = pipeline.get("first_chunk")
 
-                ffmpeg_cmd += build_ffmpeg_input_args(
-                    audio_source
-                )
-
-                ffmpeg_cmd += [
-                    "-map",
-                    "0:a:0?",
-                    "-vn",
-                    "-sn",
-                    "-dn",
-                    "-f",
-                    "dfpwm",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "1",
-                    "pipe:1",
-                ]
-
-                proc = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
+                if first_chunk:
+                    yield first_chunk
+                    pipeline["first_chunk"] = b""
 
                 while True:
-                    chunk = await asyncio.to_thread(
-                        proc.stdout.read,
-                        4096,
+                    chunk = await read_pipeline_chunk(
+                        pipeline,
+                        size=4096,
+                        timeout=45,
                     )
 
                     if not chunk:
-                        if proc.poll() is not None:
-                            if proc.returncode != 0:
-                                URL_CACHE.pop(id, None)
-                                print(
-                                    f">>> [FFMPEG] fonte falhou "
-                                    f"para {id}; cache removido"
-                                )
-                            else:
-                                print(
-                                    f">>> [FFMPEG] finalizado "
-                                    f"para {id}"
-                                )
                         break
 
                     yield chunk
@@ -1027,22 +1219,44 @@ async def handle_request(
                 pass
 
             except Exception as exc:
-                URL_CACHE.pop(id, None)
                 print(
-                    f">>> [STREAM] erro para {id}: {exc}"
+                    f">>> [STREAM] erro para {id}: "
+                    f"{str(exc)[:300]}"
                 )
 
             finally:
-                if proc and proc.poll() is None:
-                    proc.terminate()
+                ffmpeg = pipeline.get("ffmpeg")
+                ytdlp = pipeline.get("ytdlp")
+                label = pipeline.get("label")
 
-                    try:
-                        proc.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                # Se terminou naturalmente, registra apenas uma linha.
+                ffmpeg_code = (
+                    ffmpeg.poll()
+                    if ffmpeg
+                    else None
+                )
 
-                if proc and proc.stdout:
-                    proc.stdout.close()
+                ytdlp_code = (
+                    ytdlp.poll()
+                    if ytdlp
+                    else None
+                )
+
+                stop_pipeline(pipeline)
+
+                if (
+                    ffmpeg_code in (None, 0)
+                    and ytdlp_code in (None, 0)
+                ):
+                    print(
+                        f">>> [STREAM] finalizado "
+                        f"({label}) para {id}"
+                    )
+                else:
+                    print(
+                        f">>> [STREAM] encerrado "
+                        f"({label}) para {id}"
+                    )
 
         return StreamingResponse(
             stream_bytes(),

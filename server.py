@@ -6,6 +6,7 @@ import asyncio
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,10 +17,131 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="4.5")
+app = FastAPI(title="iPod CC API", version="4.6")
 
 CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_CACHE_TTL = 1800
+
+# Cache local do audio JA CONVERTIDO em DFPWM.
+# Isso evita bater novamente no YouTube quando o mesmo video e pedido
+# outra vez durante a vida do container da Railway.
+DFPWM_CACHE_DIR = Path(
+    os.environ.get(
+        "DFPWM_CACHE_DIR",
+        "/tmp/apiytcc_dfpwm_cache",
+    )
+)
+DFPWM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+DFPWM_CACHE_TTL = int(
+    os.environ.get(
+        "DFPWM_CACHE_TTL",
+        str(12 * 60 * 60),
+    )
+)
+
+DFPWM_CACHE_MAX_FILES = int(
+    os.environ.get(
+        "DFPWM_CACHE_MAX_FILES",
+        "40",
+    )
+)
+
+DFPWM_CACHE_MIN_BYTES = 4096
+
+
+def dfpwm_cache_path(video_id: str) -> Path:
+    return DFPWM_CACHE_DIR / f"{video_id}.dfpwm"
+
+
+def dfpwm_part_path(video_id: str) -> Path:
+    return DFPWM_CACHE_DIR / f"{video_id}.dfpwm.part"
+
+
+def valid_dfpwm_cache(video_id: str) -> Optional[Path]:
+    path = dfpwm_cache_path(video_id)
+
+    try:
+        if not path.is_file():
+            return None
+
+        stat = path.stat()
+
+        if stat.st_size < DFPWM_CACHE_MIN_BYTES:
+            path.unlink(missing_ok=True)
+            return None
+
+        if time.time() - stat.st_mtime > DFPWM_CACHE_TTL:
+            path.unlink(missing_ok=True)
+            return None
+
+        return path
+
+    except Exception:
+        return None
+
+
+def prune_dfpwm_cache() -> None:
+    try:
+        files = [
+            path
+            for path in DFPWM_CACHE_DIR.glob("*.dfpwm")
+            if path.is_file()
+        ]
+
+        now = time.time()
+
+        for path in files:
+            try:
+                if now - path.stat().st_mtime > DFPWM_CACHE_TTL:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        files = [
+            path
+            for path in DFPWM_CACHE_DIR.glob("*.dfpwm")
+            if path.is_file()
+        ]
+
+        files.sort(
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+
+        for path in files[DFPWM_CACHE_MAX_FILES:]:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+
+async def stream_cached_dfpwm(path: Path):
+    handle = None
+
+    try:
+        handle = open(path, "rb")
+
+        while True:
+            chunk = await asyncio.to_thread(
+                handle.read,
+                4096,
+            )
+
+            if not chunk:
+                break
+
+            yield chunk
+
+    finally:
+        if handle:
+            handle.close()
+
+
+prune_dfpwm_cache()
 
 YOUTUBE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
@@ -828,7 +950,7 @@ async def open_stream_pipeline(video_id: str):
                     pipeline["ffmpeg_err"]
                 )
 
-                reason = ffmpeg_reason or ytdlp_reason
+                reason = ytdlp_reason or ffmpeg_reason
 
                 if reason:
                     print(
@@ -1149,7 +1271,7 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "4.5-ytdlp-pipe",
+                "backend": "4.6-ytdlp-pipe-cache",
             }
         )
 
@@ -1178,6 +1300,24 @@ async def handle_request(
                 },
             )
 
+        # Primeiro tenta o DFPWM local.
+        # Se essa musica ja tocou ate o fim neste container, nao toca
+        # no YouTube, yt-dlp, PO Token ou FFmpeg novamente.
+        cached_audio = valid_dfpwm_cache(id)
+
+        if cached_audio:
+            print(
+                f">>> [CACHE] DFPWM HIT para {id}"
+            )
+
+            return StreamingResponse(
+                stream_cached_dfpwm(cached_audio),
+                media_type="application/octet-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                },
+            )
+
         # O pipeline e aberto ANTES do StreamingResponse.
         # Portanto o cliente so recebe HTTP 200 depois que DFPWM real
         # saiu do FFmpeg.
@@ -1196,10 +1336,24 @@ async def handle_request(
             )
 
         async def stream_bytes():
+            cache_handle = None
+            cache_part = dfpwm_part_path(id)
+            cache_final = dfpwm_cache_path(id)
+            normal_eof = False
+
             try:
+                # Nunca reaproveita um .part antigo.
+                cache_part.unlink(missing_ok=True)
+
+                cache_handle = open(
+                    cache_part,
+                    "wb",
+                )
+
                 first_chunk = pipeline.get("first_chunk")
 
                 if first_chunk:
+                    cache_handle.write(first_chunk)
                     yield first_chunk
                     pipeline["first_chunk"] = b""
 
@@ -1211,11 +1365,14 @@ async def handle_request(
                     )
 
                     if not chunk:
+                        normal_eof = True
                         break
 
+                    cache_handle.write(chunk)
                     yield chunk
 
             except asyncio.CancelledError:
+                # Cliente saiu antes do fim. Nao salva cache parcial.
                 pass
 
             except Exception as exc:
@@ -1225,29 +1382,87 @@ async def handle_request(
                 )
 
             finally:
+                if cache_handle:
+                    try:
+                        cache_handle.flush()
+                    except Exception:
+                        pass
+
+                    try:
+                        cache_handle.close()
+                    except Exception:
+                        pass
+
                 ffmpeg = pipeline.get("ffmpeg")
                 ytdlp = pipeline.get("ytdlp")
                 label = pipeline.get("label")
 
-                # Se terminou naturalmente, registra apenas uma linha.
+                # Aguarda rapidamente os processos terminarem para saber
+                # se o arquivo recebido esta realmente completo.
+                if normal_eof:
+                    for proc in (ffmpeg, ytdlp):
+                        if proc and proc.poll() is None:
+                            try:
+                                await asyncio.to_thread(
+                                    proc.wait,
+                                    2,
+                                )
+                            except Exception:
+                                pass
+
                 ffmpeg_code = (
                     ffmpeg.poll()
                     if ffmpeg
-                    else None
+                    else 0
                 )
 
                 ytdlp_code = (
                     ytdlp.poll()
                     if ytdlp
-                    else None
+                    else 0
+                )
+
+                completed_ok = (
+                    normal_eof
+                    and ffmpeg_code == 0
+                    and ytdlp_code == 0
                 )
 
                 stop_pipeline(pipeline)
 
+                try:
+                    size = (
+                        cache_part.stat().st_size
+                        if cache_part.exists()
+                        else 0
+                    )
+                except Exception:
+                    size = 0
+
                 if (
-                    ffmpeg_code in (None, 0)
-                    and ytdlp_code in (None, 0)
+                    completed_ok
+                    and size >= DFPWM_CACHE_MIN_BYTES
                 ):
+                    try:
+                        os.replace(
+                            cache_part,
+                            cache_final,
+                        )
+                        prune_dfpwm_cache()
+
+                        print(
+                            f">>> [CACHE] DFPWM salvo para {id}"
+                        )
+                    except Exception:
+                        cache_part.unlink(
+                            missing_ok=True
+                        )
+                else:
+                    cache_part.unlink(
+                        missing_ok=True
+                    )
+
+                if completed_ok:
                     print(
                         f">>> [STREAM] finalizado "
                         f"({label}) para {id}"

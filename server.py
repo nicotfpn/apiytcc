@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="5.1")
+app = FastAPI(title="iPod CC API", version="5.2")
 
 CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_CACHE_TTL = 1800
@@ -180,6 +180,10 @@ API_HEADERS = {
 
 
 YT_PROXY = os.environ.get("YT_PROXY", "").strip()
+YT_HTTP_CHUNK_SIZE = os.environ.get(
+    "YT_HTTP_CHUNK_SIZE",
+    "512K",
+).strip() or "512K"
 
 YT_ATTEMPT_DELAY = max(
     0.0,
@@ -686,56 +690,66 @@ def fetch_via_ytdl(
 
 def stream_attempts() -> List[Dict[str, Any]]:
     """
-    Ordem enxuta para estabilidade.
+    Ordem pensada especificamente para o WARP Local Proxy.
 
-    Menos clientes significa menos requests por musica e menos chance
-    de queimar a sessao/IP do egress.
-
-    1) web_embedded:
-       rapido quando o video permite embed.
-
-    2) mweb + PO Token:
-       caminho recomendado pelo yt-dlp para GVS com provider.
-
-    3) android_vr:
-       fallback sem GVS PO Token para muitos videos comuns.
-
-    4) mweb + PO Token + cookies:
-       somente quando a sessao autenticada realmente for necessaria.
+    O proxy local da Cloudflare tem timeout curto por request. Por isso:
+    - HTTP normal usa downloads em chunks pequenos.
+    - web_safari HLS entra cedo porque ja trabalha com fragmentos curtos.
+    - mweb + PO Token continua como fallback recomendado.
+    - android_vr saiu da cadeia primaria porque a politica do YouTube
+      mudou e ele ja retornou bot-block neste egress.
     """
+    warp_http = (
+        "http://127.0.0.1:40000"
+        if "127.0.0.1:40000" in YT_PROXY
+        else None
+    )
+
     attempts: List[Dict[str, Any]] = [
         {
-            "label": "web_embedded",
+            "label": "web_embedded_chunked",
             "client": "web_embedded",
             "cookies": False,
-            "format": "bestaudio*/best*",
+            "format": "bestaudio[acodec!=none]/best[acodec!=none]",
+            "chunked": True,
         },
         {
-            "label": "mweb_pot",
+            "label": "web_safari_hls",
+            "client": "web_safari",
+            "cookies": False,
+            "format": (
+                "bestaudio[protocol*=m3u8]/"
+                "best[protocol*=m3u8]/"
+                "bestaudio[acodec!=none]/"
+                "best[acodec!=none]"
+            ),
+            "hls": True,
+        },
+        {
+            "label": "mweb_pot_chunked",
             "client": "mweb",
             "cookies": False,
-            "format": "bestaudio*/best*",
-        },
-        {
-            "label": "android_vr",
-            "client": "android_vr",
-            "cookies": False,
-            "format": "bestaudio*/best*",
+            "format": "bestaudio[acodec!=none]/best[acodec!=none]",
+            "chunked": True,
+            # O log real mostrou Socks5Error(5) no mweb.
+            # Tenta HTTP CONNECT primeiro apenas neste cliente.
+            "proxy": warp_http or YT_PROXY,
         },
     ]
 
     if HAS_COOKIES:
         attempts.append(
             {
-                "label": "mweb_pot_cookies",
+                "label": "mweb_pot_cookies_chunked",
                 "client": "mweb",
                 "cookies": True,
-                "format": "bestaudio*/best*",
+                "format": "bestaudio[acodec!=none]/best[acodec!=none]",
+                "chunked": True,
+                "proxy": warp_http or YT_PROXY,
             }
         )
 
     return attempts
-
 
 def ordered_stream_attempts(video_id: str) -> List[Dict[str, Any]]:
     attempts = stream_attempts()
@@ -830,8 +844,27 @@ def build_ytdlp_pipe_command(
         "--retry-sleep",
         "1",
         "--socket-timeout",
-        "15",
+        "8",
     ]
+
+    # O WARP Local Proxy derruba requests longos. Para formatos HTTP,
+    # forcamos Range requests pequenos; para HLS usamos o downloader
+    # nativo por fragmentos.
+    if attempt.get("chunked"):
+        cmd += [
+            "--http-chunk-size",
+            YT_HTTP_CHUNK_SIZE,
+            "--buffer-size",
+            "64K",
+            "--no-resize-buffer",
+        ]
+
+    if attempt.get("hls"):
+        cmd += [
+            "--hls-prefer-native",
+            "--fragment-retries",
+            "8",
+        ]
 
     attempt_proxy = attempt.get("proxy") or YT_PROXY
 
@@ -1126,6 +1159,24 @@ async def open_stream_pipeline(video_id: str):
 
                                 return retry_pipeline
 
+                            retry_ytdlp_reason = read_error_tail(
+                                retry_pipeline["ytdlp_err"]
+                            )
+                            retry_ffmpeg_reason = read_error_tail(
+                                retry_pipeline["ffmpeg_err"]
+                            )
+                            retry_reason = (
+                                retry_ytdlp_reason
+                                or retry_ffmpeg_reason
+                                or "timeout sem primeiro byte"
+                            )
+
+                            print(
+                                f">>> [AUDIO] "
+                                f"{retry_attempt['label']} falhou: "
+                                f"{retry_reason}"
+                            )
+
                         finally:
                             if (
                                 retry_pipeline
@@ -1135,8 +1186,8 @@ async def open_stream_pipeline(video_id: str):
 
                 else:
                     print(
-                        f">>> [AUDIO] {attempt['label']} falhou "
-                        f"antes de gerar audio"
+                        f">>> [AUDIO] {attempt['label']} timeout: "
+                        f"nenhum DFPWM saiu dentro da janela inicial"
                     )
 
             except Exception as exc:
@@ -1442,10 +1493,11 @@ async def search_youtube(search: str):
 async def health():
     return {
         "status": "online",
-        "backend": "5.1-hybrid-search-direct-stream-warp",
+        "backend": "5.2-warp-chunked-stream",
         "proxy": "enabled" if YT_PROXY else "direct",
         "search_egress": "direct",
         "stream_egress": "warp" if YT_PROXY else "direct",
+        "http_chunk_size": YT_HTTP_CHUNK_SIZE,
         "proxy_target": (
             redact_proxy(YT_PROXY)
             if YT_PROXY
@@ -1473,10 +1525,11 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "5.1-hybrid-search-direct-stream-warp",
+                "backend": "5.2-warp-chunked-stream",
                 "proxy": "enabled" if YT_PROXY else "direct",
                 "search_egress": "direct",
                 "stream_egress": "warp" if YT_PROXY else "direct",
+                "http_chunk_size": YT_HTTP_CHUNK_SIZE,
                 "pot": "bgutil-http",
                 "cache": "dfpwm",
             }

@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="4.9")
+app = FastAPI(title="iPod CC API", version="5.0")
 
 CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_CACHE_TTL = 1800
@@ -1334,7 +1334,7 @@ async def search_youtube(search: str):
 async def health():
     return {
         "status": "online",
-        "backend": "4.9-official-warp-pipe-cache",
+        "backend": "5.0-warp-autodetect-pipe-cache",
         "proxy": "enabled" if YT_PROXY else "direct",
         "proxy_target": (
             redact_proxy(YT_PROXY)
@@ -1342,7 +1342,7 @@ async def health():
             else None
         ),
         "pot": "bgutil-http",
-        "warp": "official-local-proxy" if YT_PROXY == "http://127.0.0.1:40000" else "external-or-direct",
+        "warp": "official-local-proxy" if "127.0.0.1:40000" in YT_PROXY else "external-or-direct",
         "ejs": True,
         "cache_dir": str(DFPWM_CACHE_DIR),
         "stream_rounds": YT_STREAM_ROUNDS,
@@ -1363,7 +1363,7 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "4.9-official-warp-pipe-cache",
+                "backend": "5.0-warp-autodetect-pipe-cache",
                 "proxy": "enabled" if YT_PROXY else "direct",
                 "pot": "bgutil-http",
                 "cache": "dfpwm",

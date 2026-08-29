@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="4.6")
+app = FastAPI(title="iPod CC API", version="4.8")
 
 CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_CACHE_TTL = 1800
@@ -179,6 +179,14 @@ API_HEADERS = {
 }
 
 
+YT_PROXY = os.environ.get("YT_PROXY", "").strip()
+
+if YT_PROXY:
+    print(">>> YT_PROXY ativo.")
+else:
+    print(">>> YT_PROXY nao configurado; usando egress direto.")
+
+
 def prepare_cookie_file() -> bool:
     raw = os.environ.get("YT_COOKIES", "")
 
@@ -241,6 +249,9 @@ def make_ytdl_opts(
     if use_cookies and HAS_COOKIES:
         opts["cookiefile"] = COOKIE_FILE
 
+    if YT_PROXY:
+        opts["proxy"] = YT_PROXY
+
     return opts
 
 
@@ -258,6 +269,9 @@ SEARCH_YTDL_OPTS: Dict[str, Any] = {
 
 if HAS_COOKIES:
     SEARCH_YTDL_OPTS["cookiefile"] = COOKIE_FILE
+
+if YT_PROXY:
+    SEARCH_YTDL_OPTS["proxy"] = YT_PROXY
 
 
 def is_bot_check_error(exc: Exception) -> bool:
@@ -730,6 +744,12 @@ def build_ytdlp_pipe_command(
         "--socket-timeout",
         "15",
     ]
+
+    if YT_PROXY:
+        cmd += [
+            "--proxy",
+            YT_PROXY,
+        ]
 
     if attempt.get("cookies") and HAS_COOKIES:
         cmd += [
@@ -1271,7 +1291,8 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "4.6-ytdlp-pipe-cache",
+                "backend": "4.8-warp-free-pipe-cache",
+                "proxy": "warp" if YT_PROXY == "http://127.0.0.1:25345" else ("external" if YT_PROXY else "direct"),
             }
         )
 

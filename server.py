@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="5.0")
+app = FastAPI(title="iPod CC API", version="5.1")
 
 CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_CACHE_TTL = 1800
@@ -334,8 +334,15 @@ SEARCH_YTDL_OPTS: Dict[str, Any] = {
 if HAS_COOKIES:
     SEARCH_YTDL_OPTS["cookiefile"] = COOKIE_FILE
 
-if YT_PROXY:
-    SEARCH_YTDL_OPTS["proxy"] = YT_PROXY
+# SEARCH INTENCIONALMENTE DIRETA.
+# A Railway consegue pesquisar normalmente; o bloqueio observado acontece
+# na extracao/reproducao. Cloudflare WARP proxy mode pode recusar endpoints
+# usados pela busca, entao nao passamos ytsearch pelo WARP.
+print(">>> Busca YouTube: egress direto.")
+print(
+    ">>> Stream YouTube: "
+    + ("WARP/proxy." if YT_PROXY else "Railway direto.")
+)
 
 
 def is_bot_check_error(exc: Exception) -> bool:
@@ -748,6 +755,42 @@ def ordered_stream_attempts(video_id: str) -> List[Dict[str, Any]]:
     return attempts
 
 
+def alternate_warp_proxy(proxy: str) -> Optional[str]:
+    """
+    O WARP Local Proxy moderno entende SOCKS5 e HTTP CONNECT na mesma porta.
+
+    Se o metodo selecionado no startup for recusado durante uma requisicao
+    real do YouTube, tentamos a outra interface UMA vez, no mesmo WARP.
+    """
+    if not proxy:
+        return None
+
+    if "127.0.0.1:40000" not in proxy:
+        return None
+
+    if proxy.startswith("socks5"):
+        return "http://127.0.0.1:40000"
+
+    if proxy.startswith("http://"):
+        return "socks5h://127.0.0.1:40000"
+
+    return None
+
+
+def is_proxy_transport_error(text: str) -> bool:
+    value = str(text or "").casefold()
+
+    needles = (
+        "proxyerror",
+        "socks5error",
+        "connection refused",
+        "unable to connect to proxy",
+        "tunnel connection failed",
+    )
+
+    return any(needle in value for needle in needles)
+
+
 def build_ytdlp_pipe_command(
     video_id: str,
     attempt: Dict[str, Any],
@@ -790,10 +833,12 @@ def build_ytdlp_pipe_command(
         "15",
     ]
 
-    if YT_PROXY:
+    attempt_proxy = attempt.get("proxy") or YT_PROXY
+
+    if attempt_proxy:
         cmd += [
             "--proxy",
-            YT_PROXY,
+            attempt_proxy,
         ]
 
     if attempt.get("cookies") and HAS_COOKIES:
@@ -1025,6 +1070,69 @@ async def open_stream_pipeline(video_id: str):
                         f">>> [AUDIO] {attempt['label']} falhou: "
                         f"{reason}"
                     )
+
+                    # Recuperacao especifica de transporte do WARP:
+                    # se SOCKS/HTTP local foi recusado, tenta a outra
+                    # interface da MESMA porta uma vez.
+                    current_proxy = attempt.get("proxy") or YT_PROXY
+                    alternate_proxy = alternate_warp_proxy(
+                        current_proxy
+                    )
+
+                    if (
+                        alternate_proxy
+                        and is_proxy_transport_error(reason)
+                    ):
+                        retry_attempt = dict(attempt)
+                        retry_attempt["proxy"] = alternate_proxy
+                        retry_attempt["label"] = (
+                            attempt["label"] + "_warp_alt"
+                        )
+
+                        retry_pipeline = None
+
+                        try:
+                            print(
+                                f">>> [WARP] transporte recusado; "
+                                f"tentando interface alternativa "
+                                f"para {video_id}"
+                            )
+
+                            retry_pipeline = await asyncio.to_thread(
+                                start_ytdlp_ffmpeg_pipeline,
+                                video_id,
+                                retry_attempt,
+                            )
+
+                            retry_chunk = await read_pipeline_chunk(
+                                retry_pipeline,
+                                size=2048,
+                                timeout=22,
+                            )
+
+                            if retry_chunk:
+                                retry_pipeline["first_chunk"] = retry_chunk
+
+                                CLIENT_CACHE[video_id] = {
+                                    "label": retry_attempt["label"],
+                                    "timestamp": time.time(),
+                                }
+
+                                print(
+                                    f">>> [AUDIO] "
+                                    f"{retry_attempt['label']} OK "
+                                    f"para {video_id}"
+                                )
+
+                                return retry_pipeline
+
+                        finally:
+                            if (
+                                retry_pipeline
+                                and not retry_pipeline.get("first_chunk")
+                            ):
+                                stop_pipeline(retry_pipeline)
+
                 else:
                     print(
                         f">>> [AUDIO] {attempt['label']} falhou "
@@ -1334,8 +1442,10 @@ async def search_youtube(search: str):
 async def health():
     return {
         "status": "online",
-        "backend": "5.0-warp-autodetect-pipe-cache",
+        "backend": "5.1-hybrid-search-direct-stream-warp",
         "proxy": "enabled" if YT_PROXY else "direct",
+        "search_egress": "direct",
+        "stream_egress": "warp" if YT_PROXY else "direct",
         "proxy_target": (
             redact_proxy(YT_PROXY)
             if YT_PROXY
@@ -1363,8 +1473,10 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "5.0-warp-autodetect-pipe-cache",
+                "backend": "5.1-hybrid-search-direct-stream-warp",
                 "proxy": "enabled" if YT_PROXY else "direct",
+                "search_egress": "direct",
+                "stream_egress": "warp" if YT_PROXY else "direct",
                 "pot": "bgutil-http",
                 "cache": "dfpwm",
             }

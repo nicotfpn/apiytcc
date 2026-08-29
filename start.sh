@@ -61,12 +61,12 @@ if [ "$WARP_OK" -eq 1 ]; then
     echo ">>> Testando o egress contra o YouTube..."
 
     if curl -fsS -o /dev/null --connect-timeout 4 --max-time 10 \
-        --proxy "$WARP_SOCKS" https://www.youtube.com/generate_204 \
+        --proxy "$WARP_SOCKS" https://www.youtube.com/ \
         2>/tmp/warp-socks-youtube.log; then
         YT_PROXY_SELECTED="$WARP_SOCKS"
         echo ">>> WARP YouTube: SOCKS5 OK"
     elif curl -fsS -o /dev/null --connect-timeout 4 --max-time 10 \
-        --proxy "$WARP_HTTP" https://www.youtube.com/generate_204 \
+        --proxy "$WARP_HTTP" https://www.youtube.com/ \
         2>/tmp/warp-http-youtube.log; then
         YT_PROXY_SELECTED="$WARP_HTTP"
         echo ">>> WARP YouTube: HTTP CONNECT OK"

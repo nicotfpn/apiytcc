@@ -4,75 +4,109 @@ set -u
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="$NO_PROXY"
 
-WARP_DIR="/tmp/apiytcc-warp"
-WARP_HTTP="http://127.0.0.1:25345"
-mkdir -p "$WARP_DIR"
-cd "$WARP_DIR"
+WARP_PROXY="http://127.0.0.1:40000"
+WARP_OK=0
 
-echo ">>> Tentando ativar Cloudflare WARP GRATIS..."
+echo ">>> Iniciando Cloudflare WARP OFICIAL..."
 
-if [ ! -s wgcf-account.toml ]; then
-    n=1
-    while [ "$n" -le 5 ]; do
-        echo ">>> WARP registro tentativa $n/5"
-        wgcf register --accept-tos >/tmp/wgcf-register.log 2>&1 || true
+mkdir -p /run/dbus /var/lib/cloudflare-warp
+rm -f /run/dbus/pid 2>/dev/null || true
 
-        if [ -s wgcf-account.toml ]; then
-            break
-        fi
+# O WARP funciona sem D-Bus para o proxy, mas isso evita erros ruidosos.
+dbus-daemon --system --fork >/tmp/dbus.log 2>&1 || true
 
-        n=$((n + 1))
-        sleep 4
-    done
-fi
+warp-svc --accept-tos >/tmp/warp-svc.log 2>&1 &
+WARP_SVC_PID=$!
 
-WARP_READY=0
+# Espera o daemon responder.
+i=1
+while [ "$i" -le 20 ]; do
+    if warp-cli --accept-tos status >/dev/null 2>&1; then
+        break
+    fi
 
-if [ -s wgcf-account.toml ]; then
-    wgcf generate >/tmp/wgcf-generate.log 2>&1 || true
+    if ! kill -0 "$WARP_SVC_PID" 2>/dev/null; then
+        echo ">>> AVISO: warp-svc encerrou."
+        break
+    fi
 
-    if [ -s wgcf-profile.conf ]; then
-        cat > wireproxy.conf <<EOF
-WGConfig = $WARP_DIR/wgcf-profile.conf
+    i=$((i + 1))
+    sleep 1
+done
 
-[http]
-BindAddress = 127.0.0.1:25345
+# Registro pelo cliente OFICIAL. Nao usa mais wgcf.
+if kill -0 "$WARP_SVC_PID" 2>/dev/null; then
+    if [ ! -s /var/lib/cloudflare-warp/reg.json ]; then
+        n=1
+        while [ "$n" -le 5 ]; do
+            echo ">>> WARP oficial: registro tentativa $n/5"
 
-[Resolve]
-ResolveStrategy = ipv4
-EOF
+            if warp-cli --accept-tos registration new >/tmp/warp-register.log 2>&1; then
+                break
+            fi
 
-        if wireproxy -n -c "$WARP_DIR/wireproxy.conf" >/tmp/wireproxy-check.log 2>&1; then
-            wireproxy -s -c "$WARP_DIR/wireproxy.conf" &
-            WIREPROXY_PID=$!
+            # Algumas versoes podem persistir o registro mesmo se o CLI
+            # retornar erro depois da criacao.
+            if [ -s /var/lib/cloudflare-warp/reg.json ]; then
+                break
+            fi
 
-            i=1
-            while [ "$i" -le 12 ]; do
-                if curl -fsS --connect-timeout 3 --max-time 8 \
-                    -x "$WARP_HTTP" \
-                    https://www.cloudflare.com/cdn-cgi/trace \
-                    2>/dev/null | grep -q '^warp=on$'; then
-                    WARP_READY=1
-                    break
-                fi
-
-                kill -0 "$WIREPROXY_PID" 2>/dev/null || break
-                i=$((i + 1))
-                sleep 1
-            done
-        fi
+            n=$((n + 1))
+            sleep 3
+        done
+    else
+        echo ">>> WARP oficial: registro existente."
     fi
 fi
 
-if [ "$WARP_READY" -eq 1 ]; then
-    export YT_PROXY="$WARP_HTTP"
-    echo ">>> Cloudflare WARP GRATIS: OK"
-    echo ">>> YouTube vai sair por WARP."
-else
-    unset YT_PROXY
-    echo ">>> AVISO: WARP nao iniciou; usando Railway direto."
+if [ -s /var/lib/cloudflare-warp/reg.json ]; then
+    # Proxy mode atual usa MASQUE.
+    warp-cli --accept-tos tunnel protocol set MASQUE >/tmp/warp-protocol.log 2>&1 || true
+    warp-cli --accept-tos mode proxy >/tmp/warp-mode.log 2>&1 || true
+    warp-cli --accept-tos proxy port 40000 >/tmp/warp-port.log 2>&1 || true
+    warp-cli --accept-tos connect >/tmp/warp-connect.log 2>&1 || true
+
+    # Espera o proxy local ficar utilizavel.
+    i=1
+    while [ "$i" -le 25 ]; do
+        TRACE="$(
+            curl -fsS \
+                --connect-timeout 3 \
+                --max-time 8 \
+                --proxy "$WARP_PROXY" \
+                https://www.cloudflare.com/cdn-cgi/trace \
+                2>/dev/null || true
+        )"
+
+        if printf '%s\n' "$TRACE" | grep -qE '^warp=(on|plus)$'; then
+            WARP_OK=1
+            break
+        fi
+
+        i=$((i + 1))
+        sleep 1
+    done
 fi
 
+if [ "$WARP_OK" -eq 1 ]; then
+    export YT_PROXY="$WARP_PROXY"
+    echo ">>> Cloudflare WARP OFICIAL: OK"
+    echo ">>> Proxy local: 127.0.0.1:40000"
+    echo ">>> YouTube/yt-dlp usarao WARP."
+else
+    unset YT_PROXY
+    echo ">>> AVISO: WARP oficial nao conectou; usando Railway direto."
+
+    # Mostra apenas um resumo util do motivo, sem despejar logs enormes.
+    if [ -s /tmp/warp-register.log ]; then
+        echo ">>> WARP registro: $(tail -n 1 /tmp/warp-register.log | cut -c1-240)"
+    fi
+    if [ -s /tmp/warp-connect.log ]; then
+        echo ">>> WARP connect: $(tail -n 1 /tmp/warp-connect.log | cut -c1-240)"
+    fi
+fi
+
+# O provider de PO Token deve enxergar o mesmo egress do yt-dlp.
 if [ -n "${YT_PROXY:-}" ]; then
     echo ">>> POT provider usando o mesmo WARP."
     HTTP_PROXY="$YT_PROXY" \
@@ -86,5 +120,6 @@ else
 fi
 
 sleep 2
+
 cd /app
 exec python server.py

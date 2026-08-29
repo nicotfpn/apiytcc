@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 
 
-app = FastAPI(title="iPod CC API", version="4.8")
+app = FastAPI(title="iPod CC API", version="4.9")
 
 CLIENT_CACHE: Dict[str, Dict[str, Any]] = {}
 CLIENT_CACHE_TTL = 1800
@@ -181,10 +181,74 @@ API_HEADERS = {
 
 YT_PROXY = os.environ.get("YT_PROXY", "").strip()
 
+YT_ATTEMPT_DELAY = max(
+    0.0,
+    float(os.environ.get("YT_ATTEMPT_DELAY", "1.25")),
+)
+
+YT_STREAM_ROUNDS = max(
+    1,
+    min(
+        2,
+        int(os.environ.get("YT_STREAM_ROUNDS", "1")),
+    ),
+)
+
+
+def redact_proxy(proxy: str) -> str:
+    """
+    Mostra apenas scheme/host/porta.
+    Nunca imprime usuario ou senha do proxy.
+    """
+    if not proxy:
+        return "desativado"
+
+    try:
+        parsed = urllib.parse.urlsplit(proxy)
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname or "proxy"
+        port = f":{parsed.port}" if parsed.port else ""
+
+        if parsed.username or parsed.password:
+            return f"{scheme}://***@{host}{port}"
+
+        return f"{scheme}://{host}{port}"
+
+    except Exception:
+        return "configurado"
+
+
+def sanitize_log_text(value: str) -> str:
+    text = str(value or "")
+
+    if YT_PROXY:
+        text = text.replace(
+            YT_PROXY,
+            redact_proxy(YT_PROXY),
+        )
+
+    # Evita vazar credenciais caso uma biblioteca reimprima uma URL.
+    text = re.sub(
+        r"(https?|socks5h?|socks4a?)://[^\\s/@:]+:[^\\s/@]+@",
+        r"\\1://***@",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text
+
+
 if YT_PROXY:
-    print(">>> YT_PROXY ativo.")
+    print(
+        f">>> YT_PROXY ativo: {redact_proxy(YT_PROXY)}"
+    )
+    print(
+        ">>> YouTube/yt-dlp e PO Token usarao o mesmo egress."
+    )
 else:
-    print(">>> YT_PROXY nao configurado; usando egress direto.")
+    print(
+        ">>> YT_PROXY nao configurado; usando egress direto."
+    )
 
 
 def prepare_cookie_file() -> bool:
@@ -615,19 +679,22 @@ def fetch_via_ytdl(
 
 def stream_attempts() -> List[Dict[str, Any]]:
     """
-    Ordem conservadora.
+    Ordem enxuta para estabilidade.
 
-    web_embedded:
-        Nao precisa de GVS PO Token, quando o video permite embed.
+    Menos clientes significa menos requests por musica e menos chance
+    de queimar a sessao/IP do egress.
 
-    mweb:
-        Usa o BgUtil PO Token Provider que ja esta rodando no container.
+    1) web_embedded:
+       rapido quando o video permite embed.
 
-    android_vr:
-        Cliente sem GVS PO Token para a maioria dos videos comuns.
+    2) mweb + PO Token:
+       caminho recomendado pelo yt-dlp para GVS com provider.
 
-    web_safari:
-        Preferimos HLS, que atualmente e a parte mais util desse cliente.
+    3) android_vr:
+       fallback sem GVS PO Token para muitos videos comuns.
+
+    4) mweb + PO Token + cookies:
+       somente quando a sessao autenticada realmente for necessaria.
     """
     attempts: List[Dict[str, Any]] = [
         {
@@ -648,38 +715,16 @@ def stream_attempts() -> List[Dict[str, Any]]:
             "cookies": False,
             "format": "bestaudio*/best*",
         },
-        {
-            "label": "web_safari_hls",
-            "client": "web_safari",
-            "cookies": False,
-            "format": (
-                "bestaudio[protocol^=m3u8]/"
-                "best[protocol^=m3u8]/"
-                "bestaudio*/best*"
-            ),
-        },
     ]
 
     if HAS_COOKIES:
-        attempts.extend(
-            [
-                {
-                    "label": "mweb_pot_cookies",
-                    "client": "mweb",
-                    "cookies": True,
-                    "format": "bestaudio*/best*",
-                },
-                {
-                    "label": "web_safari_hls_cookies",
-                    "client": "web_safari",
-                    "cookies": True,
-                    "format": (
-                        "bestaudio[protocol^=m3u8]/"
-                        "best[protocol^=m3u8]/"
-                        "bestaudio*/best*"
-                    ),
-                },
-            ]
+        attempts.append(
+            {
+                "label": "mweb_pot_cookies",
+                "client": "mweb",
+                "cookies": True,
+                "format": "bestaudio*/best*",
+            }
         )
 
     return attempts
@@ -807,7 +852,9 @@ def read_error_tail(handle, limit: int = 1200) -> str:
         if not lines:
             return ""
 
-        return lines[-1][:300]
+        return sanitize_log_text(
+            lines[-1][:300]
+        )
 
     except Exception:
         return ""
@@ -929,9 +976,10 @@ async def open_stream_pipeline(video_id: str):
     """
     attempts = ordered_stream_attempts(video_id)
 
-    # Duas passadas. A segunda gera uma extracao/token/sessao nova.
-    # Isso cobre falhas intermitentes sem ficar em loop infinito.
-    for round_number in (1, 2):
+    # Uma passada por padrao. Se quiser uma segunda rodada,
+    # defina YT_STREAM_ROUNDS=2. Evitamos martelar o YouTube quando
+    # o egress esta bloqueado.
+    for round_number in range(1, YT_STREAM_ROUNDS + 1):
         for attempt in attempts:
             pipeline = None
 
@@ -986,19 +1034,24 @@ async def open_stream_pipeline(video_id: str):
             except Exception as exc:
                 print(
                     f">>> [AUDIO] {attempt['label']} falhou: "
-                    f"{str(exc)[:300]}"
+                    f"{sanitize_log_text(str(exc)[:300])}"
                 )
 
             finally:
                 if pipeline and not pipeline.get("first_chunk"):
                     stop_pipeline(pipeline)
 
-        if round_number == 1:
+            if YT_ATTEMPT_DELAY > 0:
+                await asyncio.sleep(YT_ATTEMPT_DELAY)
+
+        if round_number < YT_STREAM_ROUNDS:
             print(
                 f">>> [AUDIO] nova tentativa com extracao fresca "
                 f"para {video_id}"
             )
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(
+                max(2.0, YT_ATTEMPT_DELAY)
+            )
 
     # Ultima chance: Piped/Invidious antigos.
     fallback_sources = await asyncio.gather(
@@ -1277,6 +1330,25 @@ async def search_youtube(search: str):
     )
 
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "online",
+        "backend": "4.9-official-warp-pipe-cache",
+        "proxy": "enabled" if YT_PROXY else "direct",
+        "proxy_target": (
+            redact_proxy(YT_PROXY)
+            if YT_PROXY
+            else None
+        ),
+        "pot": "bgutil-http",
+        "warp": "official-local-proxy" if YT_PROXY == "http://127.0.0.1:40000" else "external-or-direct",
+        "ejs": True,
+        "cache_dir": str(DFPWM_CACHE_DIR),
+        "stream_rounds": YT_STREAM_ROUNDS,
+    }
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def handle_request(
     request: Request,
@@ -1291,8 +1363,10 @@ async def handle_request(
             content={
                 "status": "online",
                 "version": v,
-                "backend": "4.8-warp-free-pipe-cache",
-                "proxy": "warp" if YT_PROXY == "http://127.0.0.1:25345" else ("external" if YT_PROXY else "direct"),
+                "backend": "4.9-official-warp-pipe-cache",
+                "proxy": "enabled" if YT_PROXY else "direct",
+                "pot": "bgutil-http",
+                "cache": "dfpwm",
             }
         )
 
@@ -1399,7 +1473,7 @@ async def handle_request(
             except Exception as exc:
                 print(
                     f">>> [STREAM] erro para {id}: "
-                    f"{str(exc)[:300]}"
+                    f"{sanitize_log_text(str(exc)[:300])}"
                 )
 
             finally:
